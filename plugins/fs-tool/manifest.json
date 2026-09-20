@@ -1,0 +1,15 @@
+{
+  "id": "com.official.fs-tool",
+  "name": "File Tool",
+  "description": "官方文件工具插件：readFile.v1 / writeFile.v1 / listDir.v1，全部经核心能力代理访问文件系统",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["readFile.v1", "writeFile.v1", "listDir.v1"],
+  "consumes": ["workspace.v1"],
+  "permissions": ["filesystem:read", "filesystem:write"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

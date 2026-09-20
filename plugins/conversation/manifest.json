@@ -1,0 +1,15 @@
+{
+  "id": "com.official.conversation",
+  "name": "Conversation",
+  "description": "链式对话：消息树、分支版本翻页、多会话管理，可回滚修改与重新生成",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["conversation.v1"],
+  "consumes": ["agent.v1", "llm.v1", "workspace.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

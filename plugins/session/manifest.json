@@ -1,0 +1,15 @@
+{
+  "id": "com.official.session",
+  "name": "Session",
+  "description": "会话插件：维护多轮对话历史，把消息交给 agent 插件处理并持久化",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["session.v1"],
+  "consumes": ["agent.v1", "llm.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

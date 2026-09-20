@@ -1,0 +1,15 @@
+{
+  "id": "com.official.usage",
+  "name": "Usage Monitor",
+  "description": "用量悬浮窗：在终端右上角显示 DeepSeek 余额、token 消耗与缓存命中率",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["usage.v1"],
+  "consumes": ["llm.v1"],
+  "permissions": ["network", "filesystem:read"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

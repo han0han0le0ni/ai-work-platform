@@ -1,0 +1,15 @@
+{
+  "id": "com.official.plugin-manager",
+  "name": "Plugin Manager",
+  "description": "插件管理器：列出、检查与删除插件，连目录、配置、日志一起清干净",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["pluginManager.v1"],
+  "consumes": [],
+  "permissions": ["filesystem:read", "filesystem:write", "filesystem:delete"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

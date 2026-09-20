@@ -1,0 +1,15 @@
+{
+  "id": "com.official.svgdraw",
+  "name": "SVG Drawer",
+  "description": "纯文本画图：让模型写 SVG 矢量图并存成文件，不需要任何外部图像服务",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["svgdraw.v1"],
+  "consumes": ["llm.v1", "workspace.v1", "toolExecutor.v1"],
+  "permissions": ["filesystem:write"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "id": "com.official.agent",
+  "name": "Agent",
+  "description": "Agent 插件：编排 LLM 与工具，形成「推理 → 调用工具 → 再推理」的循环",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["agent.v1"],
+  "consumes": ["llm.v1", "toolExecutor.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

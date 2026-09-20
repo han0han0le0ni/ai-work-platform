@@ -1,0 +1,767 @@
+// Command workspace 是官方工作区文件插件，提供 workspace.v1。
+//
+// 和 fs-tool 的区别：**fs-tool 是按绝对路径读单个文件的示例，这里是"先指定一个文件夹，
+// 然后在这个文件夹里随便折腾"**。所有操作都经核心的能力代理执行，插件自己不碰文件系统。
+//
+// 围栏是它的核心价值：一旦指定了工作目录，所有路径都被锁在这个目录里 ——
+// 传 ../.. 也好、绝对路径也好，只要落在外面就拒绝。
+// 这样"给某个插件一个文件夹"就成了一件可以放心做的事，而不是把整块盘交出去。
+//
+// 用法（终端界面的 /tool，或别的插件经 core.invoke 调用）：
+//
+//	/tool workspace.v1 setRoot {"path":"E:\\my-project"}
+//	/tool workspace.v1 tree
+//	/tool workspace.v1 write  {"path":"notes/a.txt","content":"hello"}
+//	/tool workspace.v1 read   {"path":"notes/a.txt"}
+//	/tool workspace.v1 delete {"path":"notes","recursive":true}
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"aiwork/sdk/go/plugin"
+)
+
+const serviceName = "workspace.v1"
+
+// 递归操作的上限：防止在一个巨大的目录树上把内存和 RPC 通道撑爆。
+const (
+	maxWalkEntries = 2000
+	maxTreeDepth   = 8
+	maxTreeEntries = 400
+	// maxCopyBytes 与核心单次能力调用的硬上限一致
+	maxCopyBytes = 4 << 20
+)
+
+// Workspace 实现 plugin.Plugin。
+type Workspace struct {
+	ctx *plugin.Context
+
+	// root 是当前指定的工作目录（绝对路径）。空表示还没指定。
+	root string
+}
+
+// ---------------------------------------------------------------------------
+// 生命周期
+// ---------------------------------------------------------------------------
+
+func (w *Workspace) Activate(ctx *plugin.Context) error {
+	w.ctx = ctx
+
+	// 上次指定的工作目录要接着用：它是用户的选择，不该每次重启都要重设一遍
+	if raw, err := ctx.GetConfig("root"); err == nil && len(raw) > 0 {
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			w.root = s
+		}
+	}
+
+	if err := ctx.Provide(serviceName, map[string]any{
+		"description": "工作区文件：在指定文件夹内创建 / 读取 / 修改 / 移动 / 复制 / 删除文件与目录",
+		"methods": []string{
+			"root", "setRoot", "browse", "list", "tree", "read", "write",
+			"mkdir", "delete", "move", "copy", "stat",
+		},
+	}); err != nil {
+		return err
+	}
+
+	ctx.Log("info", "工作区插件已就绪（workspace.v1）", map[string]any{
+		"root":        firstNonEmpty(w.root, "（尚未指定）"),
+		"permissions": ctx.Permissions,
+	})
+	return nil
+}
+
+func (w *Workspace) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service != serviceName {
+		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "工作区插件不提供服务 %s", service)
+	}
+	switch method {
+	case "root":
+		return w.showRoot()
+	case "setRoot":
+		return w.setRoot(args)
+	case "browse":
+		return w.browse(args)
+	case "list":
+		return w.list(args)
+	case "tree":
+		return w.tree(args)
+	case "read":
+		return w.read(args)
+	case "write":
+		return w.write(args)
+	case "mkdir":
+		return w.makeDir(args)
+	case "delete", "remove", "rm":
+		return w.remove(args)
+	case "move", "rename":
+		return w.move(args)
+	case "copy":
+		return w.copy(args)
+	case "stat":
+		return w.stat(args)
+	default:
+		return nil, plugin.Errorf(plugin.CodeMethodNotFound, "%s 不支持方法 %s", service, method)
+	}
+}
+
+func (w *Workspace) Deactivate() error {
+	if w.ctx != nil {
+		w.ctx.Log("info", "工作区插件退出", nil)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 工作目录
+// ---------------------------------------------------------------------------
+
+func (w *Workspace) showRoot() (any, error) {
+	out := map[string]any{"root": w.root, "set": w.root != ""}
+	if w.root == "" {
+		out["hint"] = hintWhenUnset()
+	}
+	return out, nil
+}
+
+func hintWhenUnset() string {
+	return "尚未指定工作目录：先调用 setRoot {\"path\":\"<文件夹>\"}"
+}
+
+// setRoot 指定工作目录。
+//
+// 校验方式是让核心去列一次这个目录：列得出来就说明它存在、是目录、且有权限。
+// 存下来的是核心返回的绝对路径，之后所有相对路径都以它为基准。
+func (w *Workspace) setRoot(args json.RawMessage) (any, error) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+
+	raw, err := w.ctx.FSList(in.Path)
+	if err != nil {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams,
+			"不能把 %q 作为工作目录：%v", in.Path, err)
+	}
+	var out struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, plugin.Errorf(plugin.CodeInternalError, "解析目录列表失败: %v", err)
+	}
+	if out.Path == "" {
+		return nil, plugin.Errorf(plugin.CodeInternalError, "核心未返回目录路径")
+	}
+
+	w.root = out.Path
+	if err := w.ctx.SetConfig("root", out.Path); err != nil {
+		return nil, plugin.Errorf(plugin.CodeInternalError, "保存工作目录失败: %v", err)
+	}
+	w.ctx.Log("info", "工作目录已设置", map[string]any{"root": out.Path})
+	return map[string]any{"root": out.Path, "set": true}, nil
+}
+
+// browse 列出任意目录，用来**挑选**工作目录。
+//
+// 它是唯一不受围栏限制的方法，而且只读目录名、不读文件内容 ——
+// 在 setRoot 之前总得有个办法看看盘上有什么，否则用户只能靠猜路径。
+// 一旦 setRoot，真正的文件操作（list / read / write / ...）就全部锁进围栏。
+func (w *Workspace) browse(args json.RawMessage) (any, error) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	// 空路径交给核心解析：通常是运行时目录（core.json 配了 fsRoot 就是 fsRoot）
+	target := strings.TrimSpace(in.Path)
+	if target == "" {
+		target = "."
+	}
+	raw, err := w.ctx.FSList(target)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("解析目录列表失败: %w", err)
+	}
+	items, err := w.listOne(out.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	// 给界面一个"上一级"的落点；已经在根目录下就没有上一级
+	parent := ""
+	if out.Path != "" {
+		if up := filepath.Dir(out.Path); up != out.Path {
+			parent = up
+		}
+	}
+	return map[string]any{
+		"path":      out.Path,
+		"parent":    parent,
+		"count":     len(items),
+		"entries":   items,
+		"isRoot":    w.root == out.Path,
+		"root":      w.root,
+		"rootIsSet": w.root != "",
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// 路径：围栏的全部实现都在这里
+// ---------------------------------------------------------------------------
+
+// resolve 把用户给的路径解析成绝对路径，并确保它落在工作目录内。
+//
+// 这是本插件的安全边界：相对路径一律拼到 root 下，绝对路径必须本来就在 root 里，
+// 用 .. 或换盘符绕出去的请求一律拒绝。
+func (w *Workspace) resolve(p string) (string, error) {
+	if w.root == "" {
+		return "", plugin.Errorf(plugin.CodeInvalidParams, hintWhenUnset())
+	}
+	abs := w.root
+	if s := strings.TrimSpace(p); s != "" {
+		if filepath.IsAbs(s) {
+			abs = filepath.Clean(s)
+		} else {
+			abs = filepath.Join(w.root, s)
+		}
+	}
+	return w.confine(abs)
+}
+
+// confine 校验绝对路径没有越出工作目录。
+func (w *Workspace) confine(abs string) (string, error) {
+	abs = filepath.Clean(abs)
+	rel, err := filepath.Rel(w.root, abs)
+	if err != nil {
+		return "", plugin.Errorf(plugin.CodePermissionDenied, "路径越界：%s 不在工作目录 %s 内", abs, w.root)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return "", plugin.Errorf(plugin.CodePermissionDenied,
+			"路径越界：%s 不在工作目录 %s 内（不允许用 .. 逃出去）", abs, w.root)
+	}
+	return abs, nil
+}
+
+// rel 返回路径相对工作目录的显示形式（用于输出，读起来比绝对路径短）。
+func (w *Workspace) rel(abs string) string {
+	rel, err := filepath.Rel(w.root, abs)
+	if err != nil {
+		return abs
+	}
+	return filepath.ToSlash(rel)
+}
+
+// ---------------------------------------------------------------------------
+// 列目录 / 结构
+// ---------------------------------------------------------------------------
+
+type item struct {
+	Path string `json:"path"`            // 相对工作目录，目录以 / 结尾
+	Name string `json:"name"`            // 名字
+	Dir  bool   `json:"dir"`             // 是否是目录
+	Size int64  `json:"size"`            // 文件字节数
+	Err  string `json:"error,omitempty"` // 递归时某一层读失败
+}
+
+func (w *Workspace) list(args json.RawMessage) (any, error) {
+	var in struct {
+		Path      string `json:"path"`
+		Recursive bool   `json:"recursive"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	dir, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	if !in.Recursive {
+		items, err := w.listOne(dir)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"root": w.root, "path": w.rel(dir), "count": len(items), "entries": items}, nil
+	}
+
+	items, truncated, err := w.walk(dir)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"root":      w.root,
+		"path":      w.rel(dir),
+		"count":     len(items),
+		"truncated": truncated,
+		"entries":   items,
+	}, nil
+}
+
+// listOne 列一层目录。
+func (w *Workspace) listOne(dir string) ([]item, error) {
+	raw, err := w.ctx.FSList(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path    string `json:"path"`
+		Entries []struct {
+			Name string `json:"name"`
+			Dir  bool   `json:"dir"`
+			Size int64  `json:"size"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("解析目录列表失败: %w", err)
+	}
+	items := make([]item, 0, len(out.Entries))
+	for _, e := range out.Entries {
+		name := e.Name
+		if e.Dir {
+			name += "/"
+		}
+		items = append(items, item{Path: name, Name: e.Name, Dir: e.Dir, Size: e.Size})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Dir != items[j].Dir {
+			return items[i].Dir // 目录排在前面
+		}
+		return items[i].Name < items[j].Name
+	})
+	return items, nil
+}
+
+// walk 深度优先遍历，带条目上限。
+func (w *Workspace) walk(dir string) ([]item, bool, error) {
+	var out []item
+	truncated := false
+
+	var visit func(cur, prefix string) error
+	visit = func(cur, prefix string) error {
+		if len(out) >= maxWalkEntries {
+			truncated = true
+			return nil
+		}
+		items, err := w.listOne(cur)
+		if err != nil {
+			out = append(out, item{Path: prefix, Name: filepath.Base(cur), Dir: true, Err: err.Error()})
+			return nil // 单个子目录读失败不该让整个遍历失败
+		}
+		for _, it := range items {
+			if len(out) >= maxWalkEntries {
+				truncated = true
+				return nil
+			}
+			child := it.Name
+			if prefix != "" {
+				child = prefix + "/" + it.Name
+			}
+			full := filepath.Join(cur, it.Name)
+			if it.Dir {
+				out = append(out, item{Path: child + "/", Name: it.Name, Dir: true})
+				if err := visit(full, child); err != nil {
+					return err
+				}
+				continue
+			}
+			out = append(out, item{Path: child, Name: it.Name, Size: it.Size})
+		}
+		return nil
+	}
+
+	if err := visit(dir, ""); err != nil {
+		return nil, truncated, err
+	}
+	return out, truncated, nil
+}
+
+// tree 生成一棵可读的目录树文本。
+func (w *Workspace) tree(args json.RawMessage) (any, error) {
+	var in struct {
+		Path  string `json:"path"`
+		Depth int    `json:"depth"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	depth := in.Depth
+	if depth <= 0 {
+		depth = 3
+	}
+	if depth > maxTreeDepth {
+		depth = maxTreeDepth
+	}
+	dir, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	var sb strings.Builder
+	count := 0
+	sb.WriteString(w.rel(dir) + "\n")
+
+	var visit func(cur, prefix string, level int)
+	visit = func(cur, prefix string, level int) {
+		if level > depth || count >= maxTreeEntries {
+			return
+		}
+		items, err := w.listOne(cur)
+		if err != nil {
+			sb.WriteString(prefix + "└── [读取失败: " + err.Error() + "]\n")
+			return
+		}
+		for i, it := range items {
+			if count >= maxTreeEntries {
+				sb.WriteString(prefix + "└── …（内容过多，已省略）\n")
+				return
+			}
+			count++
+			last := i == len(items)-1
+			branch := "├── "
+			next := prefix + "│   "
+			if last {
+				branch = "└── "
+				next = prefix + "    "
+			}
+			sb.WriteString(prefix + branch + it.Name + "\n")
+			if it.Dir {
+				visit(filepath.Join(cur, it.Name), next, level+1)
+			}
+		}
+	}
+	visit(dir, "", 1)
+
+	return map[string]any{"root": w.root, "path": w.rel(dir), "depth": depth, "tree": sb.String()}, nil
+}
+
+// ---------------------------------------------------------------------------
+// 读写
+// ---------------------------------------------------------------------------
+
+func (w *Workspace) read(args json.RawMessage) (any, error) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+	abs, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := w.ctx.FSRead(abs)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path      string `json:"path"`
+		Size      int64  `json:"size"`
+		Content   string `json:"content"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("解析读取结果失败: %w", err)
+	}
+	return map[string]any{
+		"path":      w.rel(abs),
+		"absPath":   abs,
+		"size":      out.Size,
+		"content":   out.Content,
+		"truncated": out.Truncated,
+	}, nil
+}
+
+func (w *Workspace) write(args json.RawMessage) (any, error) {
+	var in struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+		Append  bool   `json:"append"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+	abs, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	// mkdir=true：父目录不存在就顺手建出来，写文件不该因为少一层目录而失败
+	raw, err := w.ctx.FSWrite(abs, in.Content, in.Append, true)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path string `json:"path"`
+		Size int    `json:"size"`
+	}
+	_ = json.Unmarshal(raw, &out)
+
+	verb := "写入"
+	if in.Append {
+		verb = "追加"
+	}
+	return map[string]any{
+		"path":    w.rel(abs),
+		"absPath": abs,
+		"size":    out.Size,
+		"append":  in.Append,
+		"note":    fmt.Sprintf("已%s %d 字节", verb, out.Size),
+	}, nil
+}
+
+func (w *Workspace) makeDir(args json.RawMessage) (any, error) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+	abs, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := w.ctx.FSMkdir(abs, true)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path    string `json:"path"`
+		Created bool   `json:"created"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	note := "目录已存在"
+	if out.Created {
+		note = "目录已创建"
+	}
+	return map[string]any{
+		"path":    w.rel(abs),
+		"absPath": abs,
+		"created": out.Created,
+		"note":    note,
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// 删除 / 移动 / 复制
+// ---------------------------------------------------------------------------
+
+func (w *Workspace) remove(args json.RawMessage) (any, error) {
+	var in struct {
+		Path      string `json:"path"`
+		Recursive bool   `json:"recursive"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.Path) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+	abs, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	// 不许把工作目录自己删了
+	if samePath(abs, w.root) {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "不能删除工作目录本身：%s", w.root)
+	}
+	raw, err := w.ctx.FSDelete(abs, in.Recursive)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Path    string `json:"path"`
+		Existed bool   `json:"existed"`
+		Deleted bool   `json:"deleted"`
+		Moved   bool   `json:"moved"`
+		Pending string `json:"pending"`
+		Error   string `json:"error"`
+	}
+	_ = json.Unmarshal(raw, &out)
+
+	res := map[string]any{
+		"path":    w.rel(abs),
+		"absPath": abs,
+		"existed": out.Existed,
+		"deleted": out.Deleted,
+		"moved":   out.Moved,
+	}
+	if out.Pending != "" {
+		res["pending"] = out.Pending
+		res["note"] = "目标被占用，已移入待删除区，稍后清理"
+	}
+	if out.Error != "" {
+		res["error"] = out.Error
+	}
+	if !out.Existed {
+		res["note"] = "目标不存在，无需删除"
+	}
+	return res, nil
+}
+
+func (w *Workspace) move(args json.RawMessage) (any, error) {
+	var in struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.From) == "" || strings.TrimSpace(in.To) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 from / to")
+	}
+	// 起点与终点都必须落在工作目录内
+	from, err := w.resolve(in.From)
+	if err != nil {
+		return nil, err
+	}
+	to, err := w.resolve(in.To)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := w.ctx.FSMove(from, to); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"from": w.rel(from), "to": w.rel(to), "moved": true,
+		"note": fmt.Sprintf("已移动 %s → %s", w.rel(from), w.rel(to)),
+	}, nil
+}
+
+// copy 按文本复制一个文件。
+//
+// 说明白限制：内容要经 JSON 传一趟，所以只适合 UTF-8 文本。
+// 二进制文件请用 move（改名不经过内容传输）。
+func (w *Workspace) copy(args json.RawMessage) (any, error) {
+	var in struct {
+		From string `json:"from"`
+		To   string `json:"to"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(in.From) == "" || strings.TrimSpace(in.To) == "" {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 from / to")
+	}
+	from, err := w.resolve(in.From)
+	if err != nil {
+		return nil, err
+	}
+	to, err := w.resolve(in.To)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := w.ctx.Capability("core.fs.read", map[string]any{"path": from, "limit": maxCopyBytes})
+	if err != nil {
+		// 目录读不出来（core.fs.read 明确拒绝目录），给一句有用的提示
+		return nil, plugin.Errorf(plugin.CodeInvalidParams,
+			"读取 %s 失败（%v）。copy 只支持单个文件，目录请用 move 或逐个复制", w.rel(from), err)
+	}
+	var src struct {
+		Size      int64  `json:"size"`
+		Content   string `json:"content"`
+		Truncated bool   `json:"truncated"`
+	}
+	if err := json.Unmarshal(raw, &src); err != nil {
+		return nil, fmt.Errorf("解析读取结果失败: %w", err)
+	}
+	if src.Truncated {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams,
+			"%s 超过 %d 字节的复制上限，请改用 move", w.rel(from), maxCopyBytes)
+	}
+	if _, err := w.ctx.FSWrite(to, src.Content, false, true); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"from": w.rel(from), "to": w.rel(to), "size": src.Size, "copied": true,
+		"note": "按文本复制（二进制文件请用 move）",
+	}, nil
+}
+
+// stat 查看单个条目的信息。
+func (w *Workspace) stat(args json.RawMessage) (any, error) {
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := decode(args, &in); err != nil {
+		return nil, err
+	}
+	abs, err := w.resolve(in.Path)
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(abs)
+	items, err := w.listOne(parent)
+	if err != nil {
+		return nil, err
+	}
+	name := filepath.Base(abs)
+	for _, it := range items {
+		if it.Name == name {
+			return map[string]any{
+				"path": w.rel(abs), "absPath": abs,
+				"name": it.Name, "dir": it.Dir, "size": it.Size,
+			}, nil
+		}
+	}
+	return nil, plugin.Errorf(plugin.CodeInvalidParams, "工作区里没有 %s", w.rel(abs))
+}
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+func decode(args json.RawMessage, v any) error {
+	if len(args) == 0 || string(args) == "null" {
+		return nil
+	}
+	if err := json.Unmarshal(args, v); err != nil {
+		return plugin.Errorf(plugin.CodeInvalidParams, "参数非法: %v", err)
+	}
+	return nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func samePath(a, b string) bool {
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+func main() {
+	if err := plugin.Serve(&Workspace{}); err != nil {
+		plugin.Logf("error", "工作区插件退出: %v", err)
+		os.Exit(1)
+	}
+}

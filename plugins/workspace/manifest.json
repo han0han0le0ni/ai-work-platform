@@ -1,0 +1,15 @@
+{
+  "id": "com.official.workspace",
+  "name": "Workspace Files",
+  "description": "工作区文件插件：指定一个文件夹，在里面创建 / 读取 / 修改 / 移动 / 删除文件与目录，越界一律拒绝",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["workspace.v1"],
+  "consumes": [],
+  "permissions": ["filesystem:read", "filesystem:write", "filesystem:delete"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

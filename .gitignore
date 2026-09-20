@@ -1,0 +1,21 @@
+# 构建产物与运行时数据：全部集中在 runtime/，源码树里不放任何产物
+/runtime/
+/dist/
+
+# 二进制
+*.exe
+*.test
+*.out
+
+# 运行时数据（任何层级）：LLM 密钥、插件配置、会话/聊天记录、日志都在里面
+runtime/
+
+# 日志与本地覆盖配置
+*.log
+*.local.json
+
+# 编辑器
+.idea/
+.vscode/
+.trae/
+.DS_Store

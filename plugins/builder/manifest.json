@@ -1,0 +1,15 @@
+{
+  "id": "com.official.builder",
+  "name": "Plugin Builder",
+  "description": "插件构建器：把 AI 写的 Go 源码编译成可执行文件。只暴露固定的构建动作，不接受任意命令",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["builder.v1"],
+  "consumes": [],
+  "permissions": ["process:spawn", "filesystem:read", "filesystem:write"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

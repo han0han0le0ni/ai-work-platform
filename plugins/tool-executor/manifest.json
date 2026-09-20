@@ -1,0 +1,15 @@
+{
+  "id": "com.official.tool-executor",
+  "name": "Tool Executor",
+  "description": "工具执行器：维护工具目录、向 LLM 暴露 JSON Schema、按名字执行工具",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["toolExecutor.v1"],
+  "consumes": ["readFile.v1", "writeFile.v1", "listDir.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}
