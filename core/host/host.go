@@ -443,6 +443,21 @@ func (h *Host) stateEvent(pluginID string, st process.State) {
 	h.Emit("plugin.state", payload, "core")
 }
 
+// unloadPlugin 停掉一个插件的进程并把它整个摘除，返回被注销的服务名。
+//
+// 只碰 sup / reg / bus 三张内存表：权限撤销、日志、事件广播由调用方（core.unload）
+// 做 —— 这样它不依赖 caps 和 logs，可以单独测。停进程走规范 1.6：SIGTERM → 3 秒
+// → SIGKILL，赖着不走的也会被强杀。
+func (h *Host) unloadPlugin(pluginID string) []string {
+	if p := h.sup.Get(pluginID); p != nil {
+		p.Stop(time.Second)
+	}
+	h.sup.Remove(pluginID)
+	removed := h.reg.RemovePlugin(pluginID)
+	h.bus.UnsubscribeAll(pluginID)
+	return removed
+}
+
 // Run 启动插件、打开格式化控制通道、监听信号并阻塞。
 func (h *Host) Run() error {
 	if err := h.Start(); err != nil {
@@ -872,6 +887,49 @@ func (h *Host) HandleRequest(p *process.Plugin, msg *jsonrpc.Message) {
 				h.logs.Core("error", "重启核心失败: %v", err)
 			}
 		}()
+
+	case "core.unload":
+		// 热卸载：停掉一个插件的进程、注销它的服务，让删除能当场完成，不必等重启。
+		//
+		// 这是规范 2.6"所有变更重启生效"的**例外**：卸载（往下）比加载（往上）安全。
+		// 加载新插件要管依赖拓扑、进程启动、版本兼容，热加载风险大；卸载只是杀掉
+		// 一个进程 + 清注册表，风险小得多。所以装新插件照旧重启生效，删插件可以
+		// 当场卸载 —— 用户删完不用再重启一次。
+		//
+		// 只认官方插件：这能力能杀掉任意插件，第三方不该有。
+		if !strings.HasPrefix(p.Spec.ID, officialPrefix) {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodePermissionDenied,
+				"只有官方插件可以卸载插件（%s）", p.Spec.ID))
+			return
+		}
+		var unloadParams struct {
+			ID string `json:"id"`
+		}
+		if err := decodeParams(msg, &unloadParams); err != nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInvalidParams, "%v", err))
+			return
+		}
+		if unloadParams.ID == "" {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInvalidParams, "缺少 id"))
+			return
+		}
+		target := h.sup.Get(unloadParams.ID)
+		if target == nil || !target.Alive() {
+			// 没在运行：不算错，删目录方继续走"删文件"那一路
+			p.Respond(msg.ID, map[string]any{"ok": true, "id": unloadParams.ID, "stopped": false})
+			return
+		}
+		h.logs.Core("info", "插件 %s 请求热卸载 %s", p.Spec.ID, unloadParams.ID)
+		removed := h.unloadPlugin(unloadParams.ID)
+		// 进程停了之后关掉它的日志句柄：句柄持续持有的话 Windows 上
+		// logs/<id>.log 删不掉，删除就还是得"重启后生效"。
+		h.logs.ClosePlugin(unloadParams.ID)
+		h.caps.Revoke(unloadParams.ID)
+		h.stateEvent(unloadParams.ID, process.StateDead)
+		p.Respond(msg.ID, map[string]any{
+			"ok": true, "id": unloadParams.ID, "stopped": true,
+			"removedServices": removed,
+		})
 
 	default:
 		// 规范 3.5 能力代理：文件 / 网络 / 系统调用由核心代为执行，

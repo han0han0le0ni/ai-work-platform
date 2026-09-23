@@ -3,11 +3,97 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"regexp"
 	"strings"
 
 	"aiwork/sdk/go/plugin"
 )
+
+// ---------------------------------------------------------------------------
+// 协议选错的提示
+// ---------------------------------------------------------------------------
+
+// protocolMismatchHint 识别"provider 选的协议和服务说的不是一套"，并给出可执行的动作。
+//
+// 这是最容易踩、也最难自查的一个坑 —— 地址完全正确，只是协议不匹配：
+//
+//	LM Studio / vLLM / one-api / llama.cpp   只认 OpenAI 的 /v1/chat/completions
+//	Ollama                                   只认自己的 /api/chat
+//
+// 两边的报错都含糊得没有线索：Ollama 被按 OpenAI 协议问会回 "404 page not found"，
+// 而 LM Studio 被按 Ollama 协议问更绝 —— **回 HTTP 200** 加一句
+// {"error":"Unexpected endpoint or method."}，状态码检查根本拦不住。
+// 于是用户看到的只是"连不上"，而真正该做的是把 provider 换掉。
+//
+// spokeOllama 表示"我们刚才说的是 Ollama 协议"，用来决定该往哪边提示。
+func protocolMismatchHint(body string, spokeOllama bool) string {
+	low := strings.ToLower(body)
+	if !strings.Contains(low, "unexpected endpoint") && !strings.Contains(low, "page not found") {
+		return ""
+	}
+	if spokeOllama {
+		return "\n提示：这个地址不认 Ollama 的 /api/chat —— 它更可能是 OpenAI 兼容接口" +
+			"（LM Studio / vLLM / one-api / llama.cpp 都算）。把 provider 改成 openai 再试，" +
+			"地址通常还要带上 /v1。"
+	}
+	return "\n提示：这个地址不认 OpenAI 的 /v1/chat/completions —— 它可能就是本地 Ollama。" +
+		"把 provider 改成 ollama 再试（Ollama 的原生接口是 /api/chat）。"
+}
+
+// ---------------------------------------------------------------------------
+// 密钥被拒的提示
+// ---------------------------------------------------------------------------
+
+// authHint 在"密钥被拒 + 地址在本机/内网"时给一句可操作的提示。
+//
+// 本地服务未必免鉴权，这一点最容易卡住人：LM Studio 有一个「要求 API 令牌」的开关
+// （默认关，在 Developers → Server Settings 里），一旦打开，所有请求都必须带上
+// **它自己生成**的令牌 —— 而密钥框里留着的往往是云端的密钥。
+// 此时报错只有一句"接口拒绝了这个密钥"，没有人会想到问题出在服务端自己开的鉴权上，
+// 于是就在地址和模型名之间来回打转。
+//
+// 顺带提醒"这个框是全平台共用的"：本机令牌与云端密钥没法同时留着，
+// 换服务就得换密钥 —— 不说清楚，用户会以为是自己填错了。
+func authHint(status int, baseURL string) string {
+	if status != 401 && status != 403 {
+		return ""
+	}
+	if !isLocalHost(baseURL) {
+		return ""
+	}
+	// 注意别在这里用 markdown 的粗体标记：报错是给终端看的纯文本，
+	// **xxx** 只会原样显示成两个星号。
+	//
+	// 状态栏是单行截断的，所以**动作要放在最前面**：截掉尾巴后用户至少知道
+	// "去服务端关掉/填上校验"，而不是只看到一句干巴巴的"接口拒绝了这个密钥"。
+	return "\n提示：这个本地服务自己开着密钥校验，所以拒绝了请求 —— " +
+		"LM Studio：Settings → Developer → Local Server 的「要求 API 令牌」，" +
+		"关掉它，或用 Manage Tokens 里生成的令牌填到 API Key；" +
+		"Ollama：检查是否设了 OLLAMA_API_KEY 环境变量。" +
+		"注意 API Key 框全平台共用：切回云端服务要再换成云端的密钥。"
+}
+
+// isLocalHost 判断地址是否指向本机或内网。
+func isLocalHost(raw string) bool {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
 
 // ---------------------------------------------------------------------------
 // provider 抽象
@@ -298,15 +384,17 @@ func openaiChat(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 	}
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"HTTP %d，响应不是合法 JSON：%s", status, clipRunes(raw, 300))
+			"HTTP %d，响应不是合法 JSON：%s%s", status, clipRunes(raw, 300), protocolMismatchHint(raw, false))
 	}
 	if payload.Error != nil {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"模型返回错误（HTTP %d）：%s", status, payload.Error.Message)
+			"模型返回错误（HTTP %d）：%s%s%s", status, payload.Error.Message,
+			protocolMismatchHint(payload.Error.Message, false), authHint(status, cfg.BaseURL))
 	}
 	if status < 200 || status >= 300 {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"模型接口返回 HTTP %d：%s", status, clipRunes(raw, 300))
+			"模型接口返回 HTTP %d：%s%s%s", status, clipRunes(raw, 300),
+			protocolMismatchHint(raw, false), authHint(status, cfg.BaseURL))
 	}
 	if len(payload.Choices) == 0 {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
@@ -381,8 +469,8 @@ func ollamaChat(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 	}
 	if status < 200 || status >= 300 {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"Ollama 返回 HTTP %d：%s\n提示：确认 Ollama 已在 %s 运行，且模型 %s 已 pull。",
-			status, clipRunes(raw, 300), cfg.BaseURL, cfg.Model)
+			"Ollama 返回 HTTP %d：%s\n提示：确认 Ollama 已在 %s 运行，且模型 %s 已 pull。%s",
+			status, clipRunes(raw, 300), cfg.BaseURL, cfg.Model, protocolMismatchHint(raw, true))
 	}
 
 	var payload struct {
@@ -405,7 +493,11 @@ func ollamaChat(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 			"Ollama 响应不是合法 JSON：%s", clipRunes(raw, 300))
 	}
 	if payload.Error != "" {
-		return nil, plugin.Errorf(plugin.CodeInternalError, "Ollama 返回错误：%s", payload.Error)
+		// LM Studio 这类只认 OpenAI 协议的服务，会对 /api/chat 回
+		// HTTP 200 + {"error":"Unexpected endpoint or method."}：状态码拦不住它，
+		// 只能从 error 文本里认出"协议选错了"这件事，并直接说清该改哪个字段。
+		return nil, plugin.Errorf(plugin.CodeInternalError,
+			"Ollama 返回错误：%s%s", payload.Error, protocolMismatchHint(payload.Error, true))
 	}
 
 	resp := &chatResp{

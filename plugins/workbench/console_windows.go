@@ -39,6 +39,7 @@ const (
 	leftCtrlDown   = 0x0008
 	rightAltDown   = 0x0001 // Win32：RIGHT_ALT_PRESSED
 	leftAltDown    = 0x0002 // Win32：LEFT_ALT_PRESSED
+	rightCtrlDown  = 0x0004 // Win32：RIGHT_CTRL_PRESSED
 )
 
 // 虚拟键码
@@ -247,6 +248,10 @@ func decodeKeyRecord(rec inputRecord) (event, bool) {
 
 	switch vk {
 	case vkReturn:
+		// Ctrl+回车 = 发送。回车本身已经是换行了，键盘用户需要这样一个送出口。
+		if ctrl&(leftCtrlDown|rightCtrlDown) != 0 {
+			return keyEvent(keyCtrlEnter), true
+		}
 		return keyEvent(keyEnter), true
 	case vkBack:
 		return keyEvent(keyBackspace), true
@@ -278,6 +283,8 @@ func decodeKeyRecord(rec inputRecord) (event, bool) {
 			return keyEvent(keyCtrlC), true
 		case 0x0c:
 			return keyEvent(keyCtrlL), true
+		case 0x11:
+			return keyEvent(keyCtrlQ), true
 		}
 	}
 	return event{}, false

@@ -12,7 +12,7 @@ ROOT  := $(shell pwd)
 RT    := $(ROOT)/runtime
 
 # 默认界面是 workbench；minimal-ui 只作为内置保底包，不进 plugins/（两者都会抢 ui.v1）
-GO_PLUGINS     := fs-tool llm tool-executor agent session conversation workbench plugin-manager workspace builder imagegen svgdraw usage-monitor
+GO_PLUGINS     := fs-tool llm tool-executor agent session conversation roleplay workbench plugin-manager workspace builder imagegen svgdraw usage-monitor
 BUILTIN_UIS    := minimal-ui workbench
 
 # 启动器：产品名放在 launcher/name.txt，两个平台共用同一份

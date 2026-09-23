@@ -1,0 +1,15 @@
+{
+  "id": "com.official.roleplay",
+  "name": "Roleplay",
+  "description": "角色扮演插件：角色卡（设定/性格/场景/开场白）+ 我的身份 + 长期记忆，拼成系统提示词推给 agent。记忆可由对话产生（remember 工具），也可随时编辑。自带界面：角色列表 / 角色卡 / 我的身份 / 提示词预览",
+  "version": "1.1.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["roleplay.v1", "ui.page.roleplay.v1"],
+  "consumes": ["agent.v1", "toolExecutor.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

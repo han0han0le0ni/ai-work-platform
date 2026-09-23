@@ -126,6 +126,41 @@ func truncDisplay(s string, max int) string {
 	return cutDisplay(s, max-1) + "…"
 }
 
+// oneLine 把内容压成一行：换行/制表符/连续空格都收成一个空格。
+//
+// 输入框是**单行**的。值里带换行就会把那一行劈成两行，右侧那一栏的内容
+// 当场被顶歪 —— 而且不是歪一点，是整块错位。记忆天然是多行的，粘贴进来的
+// 文本也可能带换行，所以显示前必须过这一道。
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// tailDisplay 取**末尾**，开头补省略号。
+//
+// 给"只会往后长"的内容用（记忆是一条条追加的列表）。用截断显示开头的话，
+// 用户刚记住的那条永远在框外，看起来就像没记上。
+func tailDisplay(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if dispWidth(s) <= max {
+		return s
+	}
+	rs := []rune(s)
+	// 从后往前凑够宽度（留一列放省略号）
+	w := 0
+	i := len(rs)
+	for i > 0 {
+		rw := runeWidth(rs[i-1])
+		if w+rw > max-1 {
+			break
+		}
+		w += rw
+		i--
+	}
+	return "…" + string(rs[i:])
+}
+
 // padDisplay 右补空格到指定显示宽度。
 func padDisplay(s string, w int) string {
 	d := dispWidth(s)
@@ -168,6 +203,45 @@ func wrapText(s string, w int) []string {
 //
 // 关键点：宽度只在构造时按**纯文本**计算一次，样式码永远不参与宽度。
 // ---------------------------------------------------------------------------
+
+// 插件自带界面（ui.page.*）送过来的是一整行带 ANSI 样式码的字符串。样式码本身
+// 不占列，但按 rune 数一遍会把它算成十几个可见字符，于是"这一行到底几列"
+// 就量错了 —— 而量错的直接后果是右边框歪掉。所以必须跳过转义序列再量。
+
+// plainWidth 返回一行文本的显示列数，跳过 ANSI 转义序列。
+func plainWidth(s string) int {
+	w := 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i = escSeqEnd(s, i)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		w += runeWidth(r)
+		i += size
+	}
+	return w
+}
+
+// stripANSI 剥掉所有 ANSI 转义序列，只留下可见内容。
+//
+// 终端不支持颜色时用它：不然满屏都是 [38;5;111m 这样的乱码。
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, 0x1b) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			i = escSeqEnd(s, i)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		b.WriteRune(r)
+		i += size
+	}
+	return b.String()
+}
 
 type segment struct {
 	style string

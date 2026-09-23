@@ -25,7 +25,10 @@ import (
 	"aiwork/sdk/go/plugin"
 )
 
-const serviceName = "usage.v1"
+const (
+	serviceName   = "usage.v1"
+	widgetService = "ui.widget.usage.v1" // 自带浮窗：余额 / token / 命中率
+)
 
 // Usage 实现 plugin.Plugin。
 type Usage struct {
@@ -65,6 +68,14 @@ func (u *Usage) Activate(ctx *plugin.Context) error {
 		return err
 	}
 
+	// 自带浮窗：内容自己 render，界面负责画 + 拖 + 收起。
+	if err := ctx.Provide(widgetService, map[string]any{
+		"description": "用量浮窗：余额 / token / 缓存命中率（usage-monitor 自己渲染）",
+		"methods":     []string{"list", "render"},
+	}); err != nil {
+		ctx.Log("warn", "自带浮窗没能挂上（"+err.Error()+"），用量仍可经 usage.v1 查询", nil)
+	}
+
 	u.load()
 
 	// llm 插件每完成一次模型调用就发这个事件（装了计量桥才有）。
@@ -101,6 +112,9 @@ func (u *Usage) Activate(ctx *plugin.Context) error {
 
 // Handle 处理 core.invoke。
 func (u *Usage) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == widgetService {
+		return u.handleWidget(method)
+	}
 	if service != serviceName {
 		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "用量监控不提供服务 %s", service)
 	}
@@ -119,6 +133,27 @@ func (u *Usage) Handle(service, method string, args json.RawMessage) (any, error
 		return map[string]any{"ok": true, "pluginId": u.ctx.PluginID}, nil
 	default:
 		return nil, plugin.Errorf(plugin.CodeMethodNotFound, "usage.v1 不支持方法 %s", method)
+	}
+}
+
+// handleWidget 处理 ui.widget.usage.v1：报浮窗清单、画浮窗内容。
+func (u *Usage) handleWidget(method string) (any, error) {
+	switch method {
+	case "list":
+		return map[string]any{"widgets": []map[string]any{{
+			"id": "usage", "title": "用量", "w": overlayW, "h": 7,
+		}}}, nil
+	case "render":
+		u.mu.Lock()
+		totals := u.totals
+		balance := u.balance
+		u.mu.Unlock()
+		return map[string]any{
+			"title": "用量",
+			"lines": overlayLines(overlayW, totals, balance),
+		}, nil
+	default:
+		return nil, plugin.Errorf(plugin.CodeMethodNotFound, "%s 不支持方法 %s", widgetService, method)
 	}
 }
 
@@ -227,10 +262,12 @@ func (u *Usage) broadcast() {
 	u.mu.Unlock()
 
 	if claimed {
-		// 界面在等这份数据画浮窗：发不出去它不是"少一条事件"，而是浮窗永远不出现。
-		// 所以这里不吞错误 —— 静默失败最难查。
-		if err := u.ctx.Emit("usage.snapshot", u.snapshot()); err != nil {
-			u.log("warn", "广播用量失败："+err.Error())
+		// 界面在等这份数据画浮窗：喊它"我的浮窗变了"，它会重新来要一帧。
+		// 发不出去它不是"少一条事件"，而是浮窗永远停在旧数字上。
+		if err := u.ctx.Emit("ui.widget.changed", map[string]any{
+			"service": widgetService, "id": "usage",
+		}); err != nil {
+			u.log("warn", "通知浮窗刷新失败："+err.Error())
 		}
 		return
 	}

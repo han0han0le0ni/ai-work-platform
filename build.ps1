@@ -46,6 +46,9 @@ Build-GoPlugin "session" | Out-Null
 # 链式对话：消息树 / 分支版本 / 多会话（自建插件）
 Build-GoPlugin "conversation" | Out-Null
 
+# 角色扮演：角色卡 / 我的身份 / 长期记忆（拼成系统提示词推给 agent）
+Build-GoPlugin "roleplay" | Out-Null
+
 # Plugin lifecycle: list / inspect / delete plugins (delete also purges config + log).
 Build-GoPlugin "plugin-manager" | Out-Null
 
@@ -55,7 +58,7 @@ Build-GoPlugin "imagegen" | Out-Null
 # Vector drawing: the text model writes SVG, no external image service needed.
 Build-GoPlugin "svgdraw" | Out-Null
 
-# Workspace files: pick a folder, then create/edit/delete files inside it (fenced).
+# Workspace files: pick a landing folder for relative paths; absolute paths reach the whole disk.
 Build-GoPlugin "workspace" | Out-Null
 
 # Builder: compiles AI-written Go plugin sources (the only plugin that may spawn).

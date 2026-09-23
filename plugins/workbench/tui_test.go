@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aiwork/sdk/go/plugin"
 )
 
 // ---------------------------------------------------------------------------
@@ -18,16 +20,8 @@ type fakeBackend struct {
 
 	services []serviceStatus
 	plugins  []pluginInfo
-	cfg      llmConfig
-	models   []string
 
-	saved         []string
-	chats         []string
-	saves         int
-	tests         int
-	modelCalls    int
-	lastModelArgs []string
-	saveEr        error
+	chats []string
 
 	toggles []string // 记录 "id=true/false"
 	deletes []string
@@ -37,12 +31,22 @@ type fakeBackend struct {
 	deleteDirs []string
 
 	browsed    []string // 每次 browse 传下去的路径
-	setRoots   []string // 每次 setRoot 传下去的路径
 	fakeBrowse wsListing
 
-	budgetSteps     int
-	budgetUnlimited bool
-	budgetSaved     []int // configure 收到的 maxSteps
+	// 插件自带页面
+	pages        map[string][]plugin.PanelInfo // 服务名 -> 它报的页面
+	pageLines    map[string][]string           // "服务/页面id" -> 要画的行
+	pageRawLines []string                      // 非 nil 时原样送出（模拟插件画得不对）
+	pageNote     string                        // 渲染与动作共用的那句话
+	pageWantKeys bool
+	pageChatHit  bool // 额外登记一个 @ui:chat 热区
+	pageMax      int
+	pageErr      error
+	pageRenders  []string // "服务|宽|高|滚动"
+	pageActions  []string // "服务|页面|动作|参数"
+	pageKeys     []string // "服务|页面|按键|文本"
+	pageKeyRes   pageKeyResult
+	pageWantCopy bool
 
 	// 链式对话（conversation.v1）。默认关闭：不装插件的降级链路也要一直测到，
 	// 需要走消息树的用例显式打开 convOn。
@@ -73,9 +77,13 @@ type fakeBackend struct {
 	fakeImgErr error
 	openErr    error
 
-	// 浮窗位置与重启
-	floatSaves [][3]int // 每次浮窗停下：[x, y, 是否收成一条]
-	restarts   int      // 点了几次「重启」
+	// 浮窗（ui.widget.*）与重启
+	widgetInfos   []plugin.WidgetInfo
+	widgetOut     plugin.WidgetRender
+	widgetPosX    int
+	widgetPosY    int
+	widgetPosFold bool
+	restarts      int // 点了几次「重启」
 }
 
 // errTest 是测试里通用的"读不了"错误。
@@ -106,15 +114,23 @@ func (f *fakeBackend) openPath(path string) (string, error) {
 	return "已交给系统打开：" + path, nil
 }
 
-// saveFloat 记下浮窗停下的地方（x、y、有没有收成一条）。
-func (f *fakeBackend) saveFloat(x, y int, fold bool) {
+// widgetList / widgetRender 是浮窗（ui.widget.*）的假实现。
+func (f *fakeBackend) widgetList(svc string) ([]plugin.WidgetInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	folded := 0
-	if fold {
-		folded = 1
-	}
-	f.floatSaves = append(f.floatSaves, [3]int{x, y, folded})
+	return f.widgetInfos, nil
+}
+
+func (f *fakeBackend) widgetRender(svc, id string) (plugin.WidgetRender, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.widgetOut, nil
+}
+
+func (f *fakeBackend) widgetPos(svc, id string) (int, int, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.widgetPosX, f.widgetPosY, f.widgetPosFold
 }
 
 // restart 单测里不真重启核心：只记下"按了这一下"。
@@ -149,6 +165,9 @@ func (f *fakeBackend) readAttachment(path string) (attachment, error) {
 	return att, nil
 }
 
+// 角色页那一整套假实现搬去了 roleplay 插件自己的用例里（plugins/roleplay/panel_test.go）——
+// 谁实现谁测试：界面这边连"角色卡"是什么都不该知道。
+
 func (f *fakeBackend) probeServices() []serviceStatus {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -159,26 +178,6 @@ func (f *fakeBackend) scanPlugins() ([]pluginInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.plugins, nil
-}
-
-func (f *fakeBackend) setPluginEnabled(id, dir string, enabled bool) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.toggles = append(f.toggles, fmt.Sprintf("%v", enabled))
-	f.toggleDirs = append(f.toggleDirs, dir)
-	verb := "已禁用"
-	if enabled {
-		verb = "已启用"
-	}
-	return verb + " " + id, nil
-}
-
-func (f *fakeBackend) deletePlugin(id, dir string) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.deletes = append(f.deletes, id)
-	f.deleteDirs = append(f.deleteDirs, dir)
-	return "已删除 " + id, nil
 }
 
 func (f *fakeBackend) wsBrowse(path string) (wsListing, error) {
@@ -193,66 +192,86 @@ func (f *fakeBackend) wsBrowse(path string) (wsListing, error) {
 	return ls, nil
 }
 
-func (f *fakeBackend) wsSetRoot(path string) (wsListing, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.setRoots = append(f.setRoots, path)
-	ls := f.fakeBrowse
-	ls.Path = path
-	ls.Root = path
-	ls.Note = "工作区已设为 " + path
-	return ls, nil
-}
+// ---------------------------------------------------------------------------
+// 插件自带页面（ui.page.*）的假实现
+//
+// 刻意照着契约来：渲染结果一定是一块**恰好 w×h** 的画面，热区坐标是面板内的，
+// 动作名与参数原样收下。宿主与插件之间的约定就只有这几条。
+// ---------------------------------------------------------------------------
 
-func (f *fakeBackend) loadAgentBudget() (int, bool, error) {
+// pageList 刻意不受 pageErr 影响：pageErr 模拟的是"渲染/动作出错"，
+// 而清单读得到恰恰说明插件本身活着 —— 两件事分开，用例才好各自验证。
+func (f *fakeBackend) pageList(services []string) ([]pagePanel, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.budgetSteps, f.budgetUnlimited, nil
-}
-
-func (f *fakeBackend) saveAgentBudget(steps int, unlimited bool) (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if unlimited {
-		steps = -1
+	var out []pagePanel
+	for _, svc := range services {
+		for _, p := range f.pages[svc] {
+			out = append(out, pagePanel{svc: svc, id: p.ID, title: p.Title, order: p.Order})
+		}
 	}
-	f.budgetSaved = append(f.budgetSaved, steps)
-	f.budgetUnlimited = unlimited
-	f.budgetSteps = steps
-	if unlimited {
-		return "已设为不限制", nil
+	return out, nil
+}
+
+func (f *fakeBackend) pageRender(svc, id string, w, h, scroll int) (plugin.PanelRender, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pageRenders = append(f.pageRenders, fmt.Sprintf("%s|%d|%d|%d", svc, w, h, scroll))
+	if f.pageErr != nil {
+		return plugin.PanelRender{}, f.pageErr
 	}
-	return "已设为最多 " + strconv.Itoa(steps) + " 轮", nil
+	if w < 1 || h < 1 {
+		return plugin.PanelRender{}, nil
+	}
+	if f.pageRawLines != nil {
+		// 原样送出：连宽度都不修 —— 用来验证"插件画歪了，宿主自己兜住"
+		return plugin.PanelRender{
+			Lines:     f.pageRawLines,
+			Hits:      []plugin.Hit{{Y: 0, X: 0, W: 6, Action: "hello", Arg: "world"}},
+			Scroll:    scroll,
+			MaxScroll: f.pageMax,
+			Note:      f.pageNote,
+			WantKeys:  f.pageWantKeys,
+		}, nil
+	}
+	b := plugin.NewBlock(w, h)
+	for i, ln := range f.pageLines[svc+"/"+id] {
+		b.At(i).Text("", ln)
+	}
+	hw := 6
+	if hw > w {
+		hw = w
+	}
+	b.Hit(0, 0, hw, "hello", "world")
+	if f.pageChatHit && h > 1 {
+		b.Hit(1, 0, 8, "@ui:chat", "插件塞进来的话")
+	}
+	out := b.Render(scroll, f.pageMax, f.pageNote)
+	out.WantKeys = f.pageWantKeys
+	out.WantCopy = f.pageWantCopy
+	return out, nil
 }
 
-func (f *fakeBackend) loadLLM() (llmConfig, error) {
+func (f *fakeBackend) pageAction(svc, id, action, arg string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.cfg, nil
+	f.pageActions = append(f.pageActions, svc+"|"+id+"|"+action+"|"+arg)
+	if f.pageErr != nil {
+		return "", f.pageErr
+	}
+	return f.pageNote, nil
 }
 
-func (f *fakeBackend) saveLLM(provider, baseURL, model, apiKey, visionModel string) (string, error) {
+func (f *fakeBackend) pageKey(svc, id, kind, text string) (pageKeyResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.saves++
-	f.saved = []string{provider, baseURL, model, apiKey, visionModel}
-	return "已保存", f.saveEr
+	f.pageKeys = append(f.pageKeys, svc+"|"+id+"|"+kind+"|"+text)
+	return f.pageKeyRes, f.pageErr
 }
 
-func (f *fakeBackend) testLLM() (string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tests++
-	return "连接正常", nil
-}
-
-func (f *fakeBackend) listModels(provider, baseURL, apiKey string) ([]string, string, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.modelCalls++
-	f.lastModelArgs = []string{provider, baseURL, apiKey}
-	return append([]string{}, f.models...), "已获取", nil
-}
+// loadAgentBudget / saveAgentBudget / loadLLM / saveLLM / testLLM / listModels /
+// discoverLocal 的假实现随「设置」页一起搬走了：那些能力现在是 agent / llm
+// 插件自己的事，界面不再转发，测试里也不再需要模拟它们。
 
 func (f *fakeBackend) chat(text string) (string, string, error) {
 	f.mu.Lock()
@@ -516,10 +535,10 @@ func convMsgOf(t *testing.T, a *app, id string) msgView {
 	return m
 }
 
-func (f *fakeBackend) snapshot() (saves, tests int, chats []string, saved []string) {
+func (f *fakeBackend) snapshot() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.saves, f.tests, append([]string{}, f.chats...), append([]string{}, f.saved...)
+	return append([]string{}, f.chats...)
 }
 
 // newTestApp 组装一个不接核心、不碰终端的界面实例。
@@ -528,7 +547,10 @@ func newTestApp(fb *fakeBackend) *app {
 		plug:    fb,
 		apply:   make(chan func(), 8),
 		results: make(chan outcome, 8),
-		done:    make(chan struct{}),
+		// 按键队列：真实启动由 newApp 建，测试这边也要有 ——
+		// 少了它就是一条 nil channel，往它上面发等于静默丢弃。
+		pageKeys: make(chan pageKeyMsg, 64),
+		done:     make(chan struct{}),
 	}
 	a.st = &state{
 		coreVersion: "1.0.0",
@@ -536,101 +558,19 @@ func newTestApp(fb *fakeBackend) *app {
 		pluginID:    "com.official.workbench",
 		tab:         tabChat,
 		focus:       "chat",
-		fields:      defaultFields(),
-		// 预算已读过：切到设置页不再自动回读。
-		// 真实启动会自己去读（见 kickLoads），测试里由用例显式驱动，
-		// 否则每个切页的测试都会在结果通道里收到一条计划外的 budget。
-		budgetLoaded: true,
 	}
 	return a
-}
-
-// 界面和插件是同一个目录按字母序逐个激活的，界面自己也在队列里。
-//
-// 排在我后面的插件（workspace.plugin 的 works 排在 workbench 的 workb 之后）
-// 激活时，我早就扫完目录了 —— 不补这一次，它会被永久显示成「未运行」，
-// 非要用户手点一次「重新扫描」才对得上。
-func TestPluginStateEventTriggersQuietRescan(t *testing.T) {
-	fb := &fakeBackend{}
-	// 启动那一刻的快照：workspace 还没注册
-	fb.services = []serviceStatus{{name: "workspace.v1", note: "未安装"}}
-	fb.plugins = []pluginInfo{{
-		ID: "com.official.workspace", Name: "Workspace Files",
-		Provides: []string{"workspace.v1"}, Dead: []string{"workspace.v1"},
-	}}
-
-	a := newTestApp(fb)
-	a.applyOutcome(outcome{kind: "services", services: fb.services})
-	a.applyOutcome(outcome{kind: "plugins", plugins: fb.plugins, quiet: true})
-	if a.st.plugins[0].running() {
-		t.Fatal("前置条件：启动快照里 workspace 应该是未运行的")
-	}
-	a.st.status = "用户正在看的东西"
-	a.st.statusOK = true
-
-	// 插件这时才激活，数据变了
-	fb.mu.Lock()
-	fb.services = []serviceStatus{{name: "workspace.v1", alive: true, provider: "com.official.workspace"}}
-	fb.plugins = []pluginInfo{{
-		ID: "com.official.workspace", Name: "Workspace Files",
-		Provides: []string{"workspace.v1"}, Alive: []string{"workspace.v1"},
-	}}
-	fb.mu.Unlock()
-
-	// 走真实接线：核心发来 plugin.state，而不是直接调 app 的内部方法
-	w := &Workbench{app: a}
-	w.onEvent("plugin.state", []byte(`{"pluginId":"com.official.workspace","state":"active"}`))
-
-	// onEvent 会立刻投两件事：侧栏记一行事件、推进防抖序号。
-	// 取净它们（不写死条数，免得以后多投一条就把用例搞挂）。
-	for len(a.apply) > 0 {
-		drainApply(t, a)
-	}
-	// 防抖窗口过去后，计时器才把真正的那次刷新投回来
-	waitFor(t, "防抖窗口结束后投回刷新", func() bool { return len(a.apply) > 0 })
-	drainApply(t, a)
-
-	// 刷新会把插件清单与服务链路两条结果投回界面
-	drain(t, a)
-	drain(t, a)
-
-	if !a.st.plugins[0].running() {
-		t.Fatal("插件激活后应自动补扫，而不是等用户手点「重新扫描」")
-	}
-	if len(a.st.services) == 0 || !a.st.services[0].alive {
-		t.Fatal("服务链路也要跟着刷新")
-	}
-	// 自动刷新是背景行为：不许盖掉用户正在看的提示
-	if a.st.status != "用户正在看的东西" {
-		t.Fatalf("自动刷新不该动状态栏，实际 %q", a.st.status)
-	}
-}
-
-// 手动点「重新扫描」那一次要出声：用户按了按钮就得有反馈。
-func TestManualRescanIsLoud(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.rescan(false)
-	if a.st.status != "正在重新扫描…" {
-		t.Fatalf("手动扫描应先给出「正在重新扫描…」，实际 %q", a.st.status)
-	}
-}
-
-// 启动那次可能撞上 agent 尚未就绪，所以进设置页要能补读一次
-func TestSettingsTabLazyLoadsBudget(t *testing.T) {
-	fb := &fakeBackend{budgetSteps: 9}
-	a := newTestApp(fb)
-	a.st.budgetLoaded = false
-
-	a.setTab(tabSettings)
-	if !a.st.budgetBusy {
-		t.Fatal("没读到过预算时，进设置页应补读一次")
-	}
 }
 
 // layout 只做渲染，不进事件循环。
 func layout(a *app, w, h int) {
 	a.st.w, a.st.h = w, h
 	a.canv = renderFrame(a.st, w, h, false)
+}
+
+func sendNow(t *testing.T, a *app) {
+	t.Helper()
+	a.press("send")
 }
 
 // findBox 找到某个动作的热区中心点。
@@ -669,30 +609,10 @@ func seed(fb *fakeBackend) {
 		{name: "sandbox.v1", note: "未安装"},
 	}
 	fb.plugins = []pluginInfo{
-		{
-			ID: "com.official.llm", Name: "LLM", Version: "1.0.0",
-			Description: "LLM 插件：把消息与工具定义翻译成模型调用（OpenAI 兼容 / Ollama / 离线 mock）",
-			Runtime:     "binary", Entry: "main",
-			Provides: []string{"llm.v1"}, Permissions: []string{"network"},
-			Alive:  []string{"llm.v1"},
-			Compat: ">=1.0 <2.0",
-		},
-		{
-			ID: "com.official.session", Name: "Session", Version: "1.0.0",
-			Runtime: "binary", Entry: "main",
-			Provides: []string{"session.v1"}, Consumes: []string{"agent.v1"},
-			Alive: []string{"session.v1"},
-		},
-		{
-			ID: "com.official.fs-tool", Name: "File Tool", Version: "1.0.0",
-			Runtime: "binary", Entry: "main",
-			Provides: []string{"readFile.v1"},
-			Dead:     []string{"readFile.v1"},
-		},
+		{ID: "com.official.llm", Provides: []string{"llm.v1"}, Alive: []string{"llm.v1"}},
+		{ID: "com.official.session", Provides: []string{"session.v1"}, Alive: []string{"session.v1"}},
+		{ID: "com.official.fs-tool", Provides: []string{"readFile.v1"}},
 	}
-	fb.cfg = llmConfig{Provider: "openai", BaseURL: "https://api.openai.com/v1",
-		Model: "gpt-4o-mini", APIKey: "sk-t****cdef"}
-	fb.models = []string{"deepseek-chat", "deepseek-reasoner"}
 	// 文件页也要有内容，否则排版不变量测不到真实情况
 	fb.fakeBrowse = wsListing{
 		Path:   "E:\\my-project",
@@ -704,6 +624,83 @@ func seed(fb *fakeBackend) {
 			{Name: "README.md", Size: 2048},
 			{Name: "logo-with-a-very-long-name.png", Size: 1520000},
 		},
+	}
+}
+
+// 界面和插件是同一个目录按字母序逐个激活的，界面自己也在队列里。
+//
+// 排在我后面的插件（workspace.plugin 的 works 排在 workbench 的 workb 之后）
+// 激活时，我早就扫完目录了 —— 不补这一次，它会被永久显示成「未运行」，
+// 非要用户手点一次「重新扫描」才对得上。
+func TestPluginStateEventTriggersQuietRescan(t *testing.T) {
+	fb := &fakeBackend{}
+	// 启动那一刻的快照：workspace 还没注册
+	fb.services = []serviceStatus{{name: "workspace.v1", note: "未安装"}}
+	fb.plugins = []pluginInfo{{
+		ID: "com.official.workspace", Provides: []string{"workspace.v1"},
+	}}
+
+	a := newTestApp(fb)
+	a.applyOutcome(outcome{kind: "services", services: fb.services})
+	a.applyOutcome(outcome{kind: "plugins", plugins: fb.plugins, quiet: true})
+	if a.st.plugins[0].running() {
+		t.Fatal("前置条件：启动快照里 workspace 应该是未运行的")
+	}
+	a.st.status = "用户正在看的东西"
+	a.st.statusOK = true
+
+	// 插件这时才激活，数据变了
+	fb.mu.Lock()
+	fb.services = []serviceStatus{{name: "workspace.v1", alive: true, provider: "com.official.workspace"}}
+	fb.plugins = []pluginInfo{{
+		ID: "com.official.workspace", Provides: []string{"workspace.v1"}, Alive: []string{"workspace.v1"},
+	}}
+	fb.mu.Unlock()
+
+	// 走真实接线：核心发来 plugin.state，而不是直接调 app 的内部方法
+	w := &Workbench{app: a}
+	w.onEvent("plugin.state", []byte(`{"pluginId":"com.official.workspace","state":"active"}`))
+
+	// onEvent 会立刻投两件事：侧栏记一行事件、推进防抖序号。
+	// 取净它们（不写死条数，免得以后多投一条就把用例搞挂）。
+	for len(a.apply) > 0 {
+		drainApply(t, a)
+	}
+	// 防抖窗口过去后，计时器才把真正的那次刷新投回来
+	waitFor(t, "防抖窗口结束后投回刷新", func() bool { return len(a.apply) > 0 })
+	drainApply(t, a)
+
+	// 把补扫投回来的结果都收掉，收到"新的那一份真的盖上来"为止
+	// （插件清单、服务链路，可能还有插件页面清单 —— 条数不写死）。
+	//
+	// 判据必须是新数据本身：光看"两个切片非空"是不行的，它们在补扫之前
+	// 就已经非空了，那样这条用例会立刻通过、什么也没验到。
+	waitFor(t, "补扫结果回到界面", func() bool {
+		for len(a.results) > 0 {
+			drain(t, a)
+		}
+		return len(a.st.plugins) == 1 && a.st.plugins[0].running() &&
+			len(a.st.services) == 1 && a.st.services[0].alive
+	})
+
+	if !a.st.plugins[0].running() {
+		t.Fatal("插件激活后应自动补扫，而不是等用户手点「重新扫描」")
+	}
+	if len(a.st.services) == 0 || !a.st.services[0].alive {
+		t.Fatal("服务链路也要跟着刷新")
+	}
+	// 自动刷新是背景行为：不许盖掉用户正在看的提示
+	if a.st.status != "用户正在看的东西" {
+		t.Fatalf("自动刷新不该动状态栏，实际 %q", a.st.status)
+	}
+}
+
+// 手动点「重新扫描」那一次要出声：用户按了按钮就得有反馈。
+func TestManualRescanIsLoud(t *testing.T) {
+	a := newTestApp(&fakeBackend{})
+	a.rescan(false)
+	if a.st.status != "正在重新扫描…" {
+		t.Fatalf("手动扫描应先给出「正在重新扫描…」，实际 %q", a.st.status)
 	}
 }
 
@@ -743,12 +740,6 @@ func TestFrameGeometry(t *testing.T) {
 			a.st.events = []string{"10:00:03 chat.message {\"text\":\"hi\"}"}
 			a.st.services = fb.services
 			a.st.plugins = fb.plugins
-			a.st.provider = "openai"
-			a.st.wsRoot = fb.fakeBrowse.Root
-			a.st.wsPath = fb.fakeBrowse.Path
-			a.st.wsParent = fb.fakeBrowse.Parent
-			a.st.wsEntries = fb.fakeBrowse.Entries
-			a.st.wsSel = 1
 
 			layout(a, sz[0], sz[1])
 			frame := a.canv.frame()
@@ -785,25 +776,8 @@ func TestTinyWindowDegrades(t *testing.T) {
 // 点击
 // ---------------------------------------------------------------------------
 
-func TestClickSwitchesTab(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	layout(a, 100, 30)
-
-	x, y := findBox(t, a, "tab:settings")
-	if quit := a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}}); quit {
-		t.Fatal("点击标签不应退出")
-	}
-	if a.st.tab != tabSettings {
-		t.Fatalf("点击「设置」后应切到设置页，实际是 %v", a.st.tab)
-	}
-
-	layout(a, 100, 30)
-	x, y = findBox(t, a, "tab:plugins")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	if a.st.tab != tabPlugins {
-		t.Fatalf("点击「插件」后应切到插件页，实际是 %v", a.st.tab)
-	}
-}
+// 点标签切页的行为由 panel_test.go 的 TestPluginPageBecomesATabAndOpens 覆盖
+// （内置页现在只剩聊天，没有第二个标签可点）。
 
 // 点标签栏上的「重启」要真的去请核心重启。
 //
@@ -825,415 +799,16 @@ func TestClickRestartRequestsCoreRestart(t *testing.T) {
 	})
 }
 
-func TestClickPluginRowSelectsAndShowsDetail(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.plugins = fb.plugins
-	a.st.tab = tabPlugins
-	layout(a, 120, 34)
-
-	// 动作名是行号、不是插件 ID：两份插件可能同 ID，重名的话后一份永远点不中。
-	// seed 里第 3 份（下标 2）就是 fs-tool。
-	x, y := findBox(t, a, "plugin:2")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	if got := a.st.plugins[a.st.selectedPlugin].ID; got != "com.official.fs-tool" {
-		t.Fatalf("应选中 com.official.fs-tool，实际选中 %q", got)
-	}
-	if a.st.statusOK {
-		t.Fatal("选中的插件未运行，状态不应显示为正常")
-	}
-
-	// 主循环每处理完一条输入都会重绘，测试里手动补一次
-	layout(a, 120, 34)
-
-	// 详情面板要真的写出这个插件的关键信息
-	frame := a.canv.frame()
-	for _, want := range []string{"com.official.fs-tool", "readFile.v1", "未运行", "binary"} {
-		if !strings.Contains(frame, want) {
-			t.Fatalf("详情面板缺少 %q", want)
-		}
-	}
-}
-
-// 目录里躺着两份 ID 相同的插件时（x.plugin 与 x.plugin.disabled），两条都得能选中。
-//
-// 动作名曾经就是插件 ID：两份登记出两个同名的框，命中永远落在前一个上，
-// 后一条就成了怎么点都没反应的死行 —— 用户看到的就是"这个插件选不中"。
-func TestClickSecondCopyOfSamePluginIDSelectsIt(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{
-		{ID: "com.official.svgdraw", Version: "1.0.0", Dir: "svgdraw.plugin",
-			Alive: []string{"svgdraw.v1"}},
-		{ID: "com.official.svgdraw", Version: "1.0.0", Dir: "svgdraw.plugin.disabled",
-			Disabled: true, Alive: []string{"svgdraw.v1"}},
-	}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "plugin:1")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	if got := a.st.selectedPlugin; got != 1 {
-		t.Fatalf("点第二份就该选中第二份，实际下标 %d", got)
-	}
-	if got := a.st.plugins[a.st.selectedPlugin].Dir; got != "svgdraw.plugin.disabled" {
-		t.Fatalf("选中的应是禁用那份，实际 %q", got)
-	}
-}
-
-// 同 ID 有两份时，删除只能落在选中的那份上：只按 ID 找会删掉另一份。
-func TestDeleteTargetsTheSelectedCopy(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{
-		{ID: "com.official.svgdraw", Version: "1.0.0", Dir: "svgdraw.plugin",
-			Alive: []string{"svgdraw.v1"}},
-		{ID: "com.official.svgdraw", Version: "1.0.0", Dir: "svgdraw.plugin.disabled", Disabled: true},
-	}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "plugin:1")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	a.press("del")        // 第一下只是进入确认态
-	a.press("delconfirm") // 确认态下才有这个按钮
-
-	waitFor(t, "删除请求发出", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.deleteDirs) == 1
-	})
-	fb.mu.Lock()
-	dir := fb.deleteDirs[0]
-	fb.mu.Unlock()
-	if dir != "svgdraw.plugin.disabled" {
-		t.Fatalf("删的应是选中的禁用那份，实际删的是 %q", dir)
-	}
-}
-
-// 详情面板要能直接启停插件：当前启用 → 按钮显示「禁用」，点一下就传 enabled=false
-func TestClickToggleDisablesSelectedPlugin(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{
-		{ID: "com.official.fs-tool", Version: "1.0.0", Alive: []string{"readFile.v1"}},
-	}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "btn:toggle")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	waitFor(t, "启停请求发出", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.toggles) == 1
-	})
-	fb.mu.Lock()
-	got := fb.toggles[0]
-	fb.mu.Unlock()
-	if got != "false" {
-		t.Fatalf("已启用的插件点击后应传 enabled=false，实际 %q", got)
-	}
-
-	// 按钮上的字要跟着状态变：禁用后应显示「启用」
-	a.st.plugins[0].Disabled = true
-	layout(a, 120, 34)
-	if !strings.Contains(a.canv.frame(), "已禁用") {
-		t.Fatal("禁用后详情应显示已禁用状态")
-	}
-}
-
-// 删除不可逆：第一次点只是进入确认态，再点「确认删除」才真的动手
-func TestDeleteNeedsTwoClicks(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{{ID: "com.official.fs-tool", Version: "1.0.0"}}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "btn:del")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	if !a.st.confirmDelete {
-		t.Fatal("点「删除插件」应进入确认态，而不是直接删")
-	}
-	fb.mu.Lock()
-	n := len(fb.deletes)
-	fb.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("未确认前不能真的删除，实际已删 %d 次", n)
-	}
-
-	// 确认态下界面要给「确认删除」和「取消」两个出口
-	layout(a, 120, 34)
-	findBox(t, a, "btn:delconfirm")
-	findBox(t, a, "btn:delcancel")
-
-	cx, cy := findBox(t, a, "btn:delconfirm")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: cx, Y: cy, Press: true}})
-	waitFor(t, "删除请求发出", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.deletes) == 1
-	})
-	if a.st.confirmDelete {
-		t.Fatal("确认后应退出确认态")
-	}
-}
-
-// 换选中 / 按 Esc 都要撤掉上一次的删除确认：
-// 否则在 A 上点了删除、切到 B 再随手一点，删掉的就是 B 了
-func TestSwitchingPluginCancelsPendingDelete(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{
-		{ID: "com.a", Version: "1.0.0"},
-		{ID: "com.b", Version: "1.0.0"},
-	}
-	layout(a, 120, 34)
-
-	a.press("del")
-	if !a.st.confirmDelete {
-		t.Fatal("应已进入确认态")
-	}
-	a.selectPlugin(1)
-	if a.st.confirmDelete {
-		t.Fatal("换选中插件必须撤掉删除确认")
-	}
-
-	a.press("del")
-	a.handle(event{kind: evKey, key: keyEsc})
-	if a.st.confirmDelete {
-		t.Fatal("Esc 应撤掉删除确认")
-	}
-	fb.mu.Lock()
-	n := len(fb.deletes)
-	fb.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("取消后不应真的删除，实际 %d 次", n)
-	}
-}
-
-// 插件管理器和界面自己必须受保护：删掉它们就再也管不了插件了
-func TestProtectedPluginsCannotBeRemoved(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.tab = tabPlugins
-	a.st.plugins = []pluginInfo{{ID: managerPluginID, Version: "1.0.0", Self: true}}
-	layout(a, 120, 34)
-
-	if _, err := findBoxQuiet(a, "btn:del"); err == nil {
-		t.Fatal("受保护的插件不应出现删除按钮")
-	}
-	a.press("toggle")
-	fb.mu.Lock()
-	n := len(fb.toggles)
-	fb.mu.Unlock()
-	if n != 0 {
-		t.Fatal("受保护的插件不应被启停")
-	}
-	if a.st.statusOK {
-		t.Fatal("拒绝时应给出失败状态的提示")
-	}
-}
-
 // ---------------------------------------------------------------------------
-// 文件页：指定工作区，可选可填
-// ---------------------------------------------------------------------------
-
-// 点目录名进入子目录：浏览路径要接上这个名字
-func TestFilePageClickEntersDirectory(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabFiles
-	a.st.wsPath = "/tmp/proj"
-	a.st.wsEntries = []dirEntry{
-		{Name: "src", Dir: true},
-		{Name: "README.md", Size: 1024},
-	}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "wsdir:src")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	waitFor(t, "browse 被调用", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.browsed) == 1
-	})
-	fb.mu.Lock()
-	got := fb.browsed[0]
-	fb.mu.Unlock()
-	if got != "/tmp/proj/src" {
-		t.Fatalf("进入子目录应拼成 /tmp/proj/src，实际 %q", got)
-	}
-}
-
-// 上一次目录还没读完时再点一次：要给一句回话，不能默默吞掉
-func TestFilePageClickWhileBusySaysWait(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.st.tab = tabFiles
-	a.st.wsPath = "/tmp/proj"
-	a.st.wsEntries = []dirEntry{{Name: "src", Dir: true}}
-	a.st.wsBusy = true
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "wsdir:src")
-	a.click(x, y)
-	if !strings.Contains(a.st.status, "稍等") {
-		t.Fatalf("目录还在读时点击应提示稍等，实际 %q", a.st.status)
-	}
-}
-
-// 点文件只选中，不该跳目录
-func TestFilePageClickFileJustSelects(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabFiles
-	a.st.wsPath = "/tmp/proj"
-	a.st.wsEntries = []dirEntry{{Name: "a.txt", Size: 2048}}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "wsfile:a.txt")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	if len(a.st.wsEntries) != 1 || !strings.Contains(a.st.status, "a.txt") {
-		t.Fatalf("点文件应只是选中并提示，实际状态 %q", a.st.status)
-	}
-	fb.mu.Lock()
-	n := len(fb.browsed)
-	fb.mu.Unlock()
-	if n != 0 {
-		t.Fatal("点文件不应触发目录跳转")
-	}
-}
-
-// 「填」这条路：输入框打路径 → 回车 → 设为工作区
-func TestFilePageTypePathAndEnterSetsRoot(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.setTab(tabFiles)
-
-	// 进这一页就落在路径框上，不用先点输入框
-	if a.st.focus != "wsPath" {
-		t.Fatalf("切到文件页应自动聚焦路径框，实际 %q", a.st.focus)
-	}
-	typeString(a, "E:/my-project")
-	a.handle(event{kind: evKey, key: keyEnter})
-
-	waitFor(t, "setRoot 被调用", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.setRoots) == 1
-	})
-	fb.mu.Lock()
-	got := fb.setRoots[0]
-	fb.mu.Unlock()
-	if got != "E:/my-project" {
-		t.Fatalf("应把输入框里的路径设为工作区，实际 %q", got)
-	}
-}
-
-// 「选」这条路：输入框空着时，「设为工作区」用当前浏览到的目录
-func TestFilePageSetRootFallsBackToBrowsedDir(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabFiles
-	a.st.wsPath = "/tmp/proj/src"
-	if f := a.st.field("wsPath"); f != nil {
-		f.value = ""
-	}
-	layout(a, 120, 34)
-
-	x, y := findBox(t, a, "btn:wsset")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	waitFor(t, "setRoot 被调用", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.setRoots) == 1
-	})
-	fb.mu.Lock()
-	got := fb.setRoots[0]
-	fb.mu.Unlock()
-	if got != "/tmp/proj/src" {
-		t.Fatalf("输入框为空时应回退到当前浏览目录，实际 %q", got)
-	}
-}
-
-// 进页面时的懒加载正在读目录，用户这时候按回车也必须生效。
+// 插件页整块搬进了插件管理器自己身上
 //
-// 这条是回归测试：曾经"设置工作区"和"读目录"共用一个 busy 标志，
-// 结果刚进页面就按回车完全没反应 —— 而那正是最常见的操作顺序。
-func TestEnterWorksWhileBrowseInFlight(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.setTab(tabFiles)
-	if !a.st.wsBusy {
-		t.Fatal("进文件页应触发一次目录读取")
-	}
-
-	typeString(a, "/tmp/typed")
-	a.handle(event{kind: evKey, key: keyEnter})
-
-	waitFor(t, "setRoot 仍被调用", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.setRoots) == 1
-	})
-	fb.mu.Lock()
-	got := fb.setRoots[0]
-	fb.mu.Unlock()
-	if got != "/tmp/typed" {
-		t.Fatalf("应设置输入框里的路径，实际 %q", got)
-	}
-}
-
-// 浏览到的目录要回填进输入框：点着挑和手填看到的必须是同一个路径
-func TestBrowseUpdatesPathField(t *testing.T) {
-	fb := &fakeBackend{}
-	fb.fakeBrowse = wsListing{Path: "/somewhere/else", Parent: "/somewhere"}
-	a := newTestApp(fb)
-	a.st.tab = tabFiles
-
-	a.applyOutcome(outcome{kind: "ws", ws: &fb.fakeBrowse, note: "ok"})
-
-	if got := a.fieldValue("wsPath"); got != "/somewhere/else" {
-		t.Fatalf("浏览后输入框应回填路径，实际 %q", got)
-	}
-	if a.st.wsParent != "/somewhere" {
-		t.Fatalf("应记住上一级，实际 %q", a.st.wsParent)
-	}
-}
-
-// 界面上要真的显示工作区与目录条目
-func TestFilePageRendersRootAndEntries(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabFiles
-	a.st.wsRoot = "/tmp/proj"
-	a.st.wsPath = "/tmp/proj"
-	a.st.wsEntries = []dirEntry{
-		{Name: "src", Dir: true},
-		{Name: "notes.txt", Size: 1536},
-	}
-	layout(a, 120, 34)
-
-	frame := a.canv.frame()
-	for _, want := range []string{"/tmp/proj", "src", "notes.txt", "1.5 KB", "设为工作区"} {
-		if !strings.Contains(frame, want) {
-			t.Fatalf("文件页缺少 %q\n%s", want, frame)
-		}
-	}
-}
-
+// 这一页以前长在这儿的界面里（列表 / 详情 / 启停 / 删除 / 二次确认，一整套用例），
+// 现在由 pluginManager 自己绘制（plugins/plugin-manager/panel.go），
+// 用例也跟着搬到了那边。
+//
+// 界面这边只留"扫一遍插件目录"这件事的用例：认出自带页面的插件（ui.page.*）、
+// 说清侧栏里某个服务是谁在提供。
+// ---------------------------------------------------------------------------
 func TestHumanSize(t *testing.T) {
 	cases := []struct {
 		n    int64
@@ -1301,117 +876,182 @@ func TestCursorColumnUsesDisplayWidth(t *testing.T) {
 // 非聊天页不显示光标
 func TestCursorHiddenOutsideChat(t *testing.T) {
 	a := newTestApp(&fakeBackend{})
-	a.setTab(tabFiles)
+	a.setTab(tabPanel)
 	if got := cursorSeq(a.st, 100, 30); !strings.Contains(got, "?25l") {
 		t.Fatalf("非聊天页应隐藏光标，实际 %q", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 工具调用预算：可选自定义，也可选不限制
-// ---------------------------------------------------------------------------
-
-// 点「不限制」再应用：写给 agent 的必须是 -1
-func TestBudgetUnlimited(t *testing.T) {
-	fb := &fakeBackend{budgetSteps: 6}
+func TestEnterInsertsNewlineInsteadOfSending(t *testing.T) {
+	fb := &fakeBackend{}
 	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	layout(a, 120, 46)
+	a.setTab(tabChat)
+	layout(a, 100, 30)
 
-	x, y := findBox(t, a, "budget:unlimited")
+	typeString(a, "第一行")
+	a.handle(event{kind: evKey, key: keyEnter})
+	typeString(a, "第二行")
+
+	if got := string(a.st.input); got != "第一行\n第二行" {
+		t.Fatalf("回车应插入换行，实际输入框是 %q", got)
+	}
+	if chats := fb.snapshot(); len(chats) != 0 {
+		t.Fatalf("回车不该发送，实际发出 %d 条", len(chats))
+	}
+
+	// 点「发送」才真的送出去，而且换行要原样留在消息里
+	layout(a, 100, 30)
+	x, y := findBox(t, a, "btn:send")
 	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	if !a.st.budgetUnlimited {
-		t.Fatal("点「不限制」应选中它")
-	}
 
-	bx, by := findBox(t, a, "btn:budgetsave")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	waitFor(t, "预算写下去", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.budgetSaved) == 1
+	waitFor(t, "点「发送」后送出", func() bool {
+		chats := fb.snapshot()
+		return len(chats) == 1
 	})
-	fb.mu.Lock()
-	got := fb.budgetSaved[0]
-	fb.mu.Unlock()
-	if got != -1 {
-		t.Fatalf("不限制应写成 -1，实际 %d", got)
+	if chats := fb.snapshot(); chats[0] != "第一行\n第二行" {
+		t.Fatalf("发出去的应是含换行的原文，实际 %q", chats[0])
+	}
+	if len(a.st.input) != 0 {
+		t.Fatalf("发送后输入框应清空，实际 %q", string(a.st.input))
 	}
 }
 
-// 自定义步数：填多少就写多少（不再被硬上限截断）
-func TestBudgetCustomSteps(t *testing.T) {
-	fb := &fakeBackend{budgetSteps: 6}
+// 空输入点「发送」：什么都不发生，也不该崩。
+func TestSendWithEmptyInputDoesNothing(t *testing.T) {
+	fb := &fakeBackend{}
 	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	layout(a, 120, 46)
+	a.setTab(tabChat)
+	layout(a, 100, 30)
 
-	if f := a.st.field("agentSteps"); f != nil {
-		f.value = ""
-		f.dirty = true
+	x, y := findBox(t, a, "btn:send")
+	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
+
+	if chats := fb.snapshot(); len(chats) != 0 {
+		t.Fatalf("空输入不该发出消息，实际 %d 条", len(chats))
 	}
-	a.st.focus = "agentSteps"
-	typeString(a, "40")
-	a.press("budgetsave")
+}
 
-	waitFor(t, "预算写下去", func() bool {
-		fb.mu.Lock()
-		defer fb.mu.Unlock()
-		return len(fb.budgetSaved) == 1
+// Ctrl+Enter 是键盘用户的送出口：回车已经变成换行，总得留一条不离开手的路。
+func TestCtrlEnterSends(t *testing.T) {
+	fb := &fakeBackend{}
+	a := newTestApp(fb)
+	a.setTab(tabChat)
+	layout(a, 100, 30)
+
+	typeString(a, "键盘发送")
+	a.handle(event{kind: evKey, key: keyCtrlEnter})
+
+	waitFor(t, "Ctrl+Enter 送出", func() bool {
+		chats := fb.snapshot()
+		return len(chats) == 1
 	})
-	fb.mu.Lock()
-	got := fb.budgetSaved[0]
-	fb.mu.Unlock()
-	if got != 40 {
-		t.Fatalf("应写入用户填的 40，实际 %d", got)
+}
+
+// 修改态的按钮叫「提交」：同一个位置做的是另一件事，别让人以为在发新消息。
+func TestEditModeButtonSaysSubmit(t *testing.T) {
+	a := newTestApp(&fakeBackend{})
+	a.setTab(tabChat)
+	a.st.editing = "n1"
+	layout(a, 100, 34)
+
+	if _, err := findBoxQuiet(a, "btn:send"); err != nil {
+		t.Fatal("修改态也必须有一个提交按钮，否则改完没法提交")
+	}
+	if !strings.Contains(a.canv.frame(), "提交") {
+		t.Fatalf("修改态按钮应写「提交」，实际帧：\n%s", a.canv.frame())
 	}
 }
 
-// 填了非数字就别写下去，并且要说清楚
-func TestBudgetRejectsBadInput(t *testing.T) {
-	fb := &fakeBackend{budgetSteps: 6}
-	a := newTestApp(fb)
-	a.setTab(tabSettings)
+// 输入框长成多行：版面给它让位，光标跟着落到正确那一行。
+func TestMultilineInputGrowsAndCursorFollows(t *testing.T) {
+	a := newTestApp(&fakeBackend{})
+	a.setTab(tabChat)
+	layout(a, 100, 30)
 
-	if f := a.st.field("agentSteps"); f != nil {
-		f.value = "abc"
-		f.dirty = true
+	empty := cursorSeq(a.st, 100, 30)
+	if !strings.HasPrefix(empty, "\033[29;") {
+		t.Fatalf("单行输入时光标在第 29 行，实际 %q", empty)
 	}
-	a.press("budgetsave")
 
-	fb.mu.Lock()
-	n := len(fb.budgetSaved)
-	fb.mu.Unlock()
-	if n != 0 {
-		t.Fatal("非法输入不应写下去")
+	typeString(a, "甲")
+	a.handle(event{kind: evKey, key: keyEnter})
+	typeString(a, "乙")
+	a.handle(event{kind: evKey, key: keyUp}) // 回到第一行
+
+	// 输入区变成两行之后，第一行被顶到第 28 行
+	first := cursorSeq(a.st, 100, 30)
+	if !strings.HasPrefix(first, "\033[28;") {
+		t.Fatalf("两行输入时第一行的光标应在第 28 行，实际 %q", first)
 	}
-	if a.st.statusOK {
-		t.Fatal("应给出失败提示")
+
+	// 帧里要真的看到两行：提示符 + 甲，以及续行 + 乙
+	layout(a, 100, 30)
+	rows := strings.Split(a.canv.frame(), "\n")
+	ok := false
+	for i, r := range rows {
+		if strings.Contains(r, "你 ›") && strings.Contains(r, "甲") &&
+			i+1 < len(rows) && strings.Contains(rows[i+1], "乙") {
+			ok = true
+		}
+	}
+	if !ok {
+		t.Fatalf("输入区应画成两行（甲 / 乙），实际帧：\n%s", a.canv.frame())
 	}
 }
 
-// 读回来的值要显示在输入框里
-func TestBudgetShowsLoadedValue(t *testing.T) {
-	fb := &fakeBackend{budgetSteps: 12}
+// ↑↓ 在多行输入里走光标；Home/End 只在当前行内走。
+func TestArrowKeysWalkInputLines(t *testing.T) {
+	a := newTestApp(&fakeBackend{})
+	a.setTab(tabChat)
+	layout(a, 100, 30)
+
+	typeString(a, "第一行")
+	a.handle(event{kind: evKey, key: keyEnter})
+	typeString(a, "第二行")
+	if a.st.cursor != len(a.st.input) {
+		t.Fatalf("前置条件：光标应在末尾，实际 %d", a.st.cursor)
+	}
+
+	a.handle(event{kind: evKey, key: keyUp})
+	if got := string(a.st.input[:a.st.cursor]); got != "第一行" {
+		t.Fatalf("↑ 应把光标带到第一行（第一行更短，夹到行尾），实际停在 %q", got)
+	}
+	a.handle(event{kind: evKey, key: keyDown})
+	if a.st.cursor != len(a.st.input) {
+		t.Fatalf("↓ 应回到第二行行尾，实际下标 %d", a.st.cursor)
+	}
+
+	a.handle(event{kind: evKey, key: keyHome})
+	if got := string(a.st.input[:a.st.cursor]); got != "第一行\n" {
+		t.Fatalf("Home 应到当前行（第二行）行首，实际停在 %q", got)
+	}
+	a.handle(event{kind: evKey, key: keyEnd})
+	if a.st.cursor != len(a.st.input) {
+		t.Fatalf("End 应到当前行行尾，实际下标 %d", a.st.cursor)
+	}
+}
+
+// 文字再长也不能压住「发送」：它现在是唯一无歧义的送出口。
+// 折行宽度必须预先扣掉按钮那几列，否则第一行文字会顶到按钮下面 —— 热区还在，人看不见。
+func TestSendButtonStaysClickableWithLongInput(t *testing.T) {
+	fb := &fakeBackend{}
 	a := newTestApp(fb)
-	a.applyOutcome(outcome{kind: "budget", budget: &agentBudget{Steps: 12}})
+	a.setTab(tabChat)
+	layout(a, 70, 30)
 
-	if got := a.fieldValue("agentSteps"); got != "12" {
-		t.Fatalf("应显示 12，实际 %q", got)
-	}
-	if !strings.Contains(a.st.budgetNote, "12") {
-		t.Fatalf("说明文字应带上当前值，实际 %q", a.st.budgetNote)
-	}
+	typeString(a, strings.Repeat("很长的一段话", 30)) // 远超一行，必然折行并滚动
+	layout(a, 70, 30)
 
-	// 不限制时输入框留空，用提示文字表达
-	a.applyOutcome(outcome{kind: "budget", budget: &agentBudget{Unlimited: true}})
-	if f := a.st.field("agentSteps"); f == nil || f.value != "" {
-		t.Fatalf("不限制时输入框应留空，实际 %+v", f)
+	x, y := findBox(t, a, "btn:send")
+	if got := a.canv.hit(x, y); got != "btn:send" {
+		t.Fatalf("「发送」那一列被别的热区占了：%q", got)
 	}
-	if !strings.Contains(a.st.budgetNote, "不限制") {
-		t.Fatalf("说明文字应写明不限制，实际 %q", a.st.budgetNote)
-	}
+	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
+
+	waitFor(t, "长文本也能点发送", func() bool {
+		chats := fb.snapshot()
+		return len(chats) == 1
+	})
 }
 
 func findBoxQuiet(a *app, action string) (int, error) {
@@ -1423,7 +1063,12 @@ func findBoxQuiet(a *app, action string) (int, error) {
 	return 0, fmt.Errorf("未找到 %s", action)
 }
 
-func TestClickServiceJumpsToItsPlugin(t *testing.T) {
+// 点侧栏里的某个服务：说清楚它此刻是谁在提供。
+//
+// 以前这一下会跳到「插件」页并选中提供者。那一页现在由插件管理器自带，
+// 而"跳进去并选中某个插件"要面板协议为某一页开特例 —— 不值当，
+// 所以这一下退回它本来就能说清的那件事。
+func TestClickServiceSaysWhoProvidesIt(t *testing.T) {
 	fb := &fakeBackend{}
 	seed(fb)
 	a := newTestApp(fb)
@@ -1434,103 +1079,14 @@ func TestClickServiceJumpsToItsPlugin(t *testing.T) {
 	x, y := findBox(t, a, "svc:session.v1")
 	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
 
-	if a.st.tab != tabPlugins {
-		t.Fatal("点击侧栏服务后应跳到插件页")
-	}
-	if got := a.st.plugins[a.st.selectedPlugin].ID; got != "com.official.session" {
-		t.Fatalf("应选中 session.v1 的提供者，实际选中 %q", got)
+	if a.st.tab != tabChat {
+		t.Fatalf("点服务不该跳页，实际 %v", a.st.tab)
 	}
 	if !a.st.statusOK {
 		t.Fatalf("session.v1 有提供者，状态应为正常：%q", a.st.status)
 	}
-	if !strings.Contains(a.st.status, "session.v1") {
-		t.Fatalf("状态栏应说明点了哪个服务，实际 %q", a.st.status)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 设置页：输入 + 保存
-// ---------------------------------------------------------------------------
-
-func TestSettingsTypingAndSave(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.st.tab = tabSettings
-	a.st.provider = "mock"
-	a.st.plugins = fb.plugins
-	layout(a, 120, 34)
-
-	// 点 API Key 输入框
-	x, y := findBox(t, a, "focus:apiKey")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	if a.st.focus != "apiKey" {
-		t.Fatalf("点击后应聚焦 apiKey，实际 %q", a.st.focus)
-	}
-
-	typeString(a, "sk-test-1234567890abcdef")
-	if got := a.fieldValue("apiKey"); got != "sk-test-1234567890abcdef" {
-		t.Fatalf("输入未落到字段上：%q", got)
-	}
-
-	// 退格删掉一个字符，确认编辑生效
-	a.handle(event{kind: evKey, key: keyBackspace})
-	if got := a.fieldValue("apiKey"); got != "sk-test-1234567890abcde" {
-		t.Fatalf("退格未生效：%q", got)
-	}
-
-	// 点选 provider
-	layout(a, 120, 34)
-	px, py := findBox(t, a, "preset:ollama")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: px, Y: py, Press: true}})
-	if a.st.provider != "ollama" {
-		t.Fatalf("点选服务预设未生效：%q", a.st.provider)
-	}
-
-	// 保存
-	layout(a, 120, 34)
-	bx, by := findBox(t, a, "btn:save")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	waitFor(t, "保存被调用", func() bool {
-		n, _, _, _ := fb.snapshot()
-		return n == 1
-	})
-	_, _, _, saved := fb.snapshot()
-	if saved[0] != "ollama" {
-		t.Fatalf("provider 应为 ollama，实际 %q", saved[0])
-	}
-	if saved[3] != "sk-test-1234567890abcde" {
-		t.Fatalf("apiKey 传递错误：%q", saved[3])
-	}
-
-	// 明文不能在界面上留下 —— 但要等保存结果回来才清（失败时必须保留）
-	var res outcome
-	select {
-	case res = <-a.results:
-	case <-time.After(2 * time.Second):
-		t.Fatal("没等到保存结果")
-	}
-	a.applyOutcome(res)
-	if got := a.fieldValue("apiKey"); got != "" {
-		t.Fatalf("保存成功后输入框应清空，实际 %q", got)
-	}
-}
-
-func TestSaveWithoutChangesIsRejected(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.st.tab = tabSettings
-	for i := range a.st.fields {
-		a.st.fields[i].value = ""
-	}
-	layout(a, 120, 34)
-	bx, by := findBox(t, a, "btn:save")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	time.Sleep(80 * time.Millisecond)
-	if n, _, _, _ := fb.snapshot(); n != 0 {
-		t.Fatal("没有任何改动时不该调用 saveLLM")
+	if !strings.Contains(a.st.status, "session.v1") || !strings.Contains(a.st.status, "com.official.session") {
+		t.Fatalf("状态栏应说明这个服务由谁提供，实际 %q", a.st.status)
 	}
 }
 
@@ -1545,13 +1101,13 @@ func TestChatSendAndRender(t *testing.T) {
 	layout(a, 100, 30)
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 
 	waitFor(t, "chat 被调用", func() bool {
-		_, _, chats, _ := fb.snapshot()
+		chats := fb.snapshot()
 		return len(chats) == 1
 	})
-	_, _, chats, _ := fb.snapshot()
+	chats := fb.snapshot()
 	if chats[0] != "你好" {
 		t.Fatalf("发送内容错误：%q", chats[0])
 	}
@@ -1586,71 +1142,14 @@ func TestMouseWheelAndScroll(t *testing.T) {
 	}
 }
 
-func TestTabKeyCyclesPages(t *testing.T) {
+// Ctrl+C 专职复制，绝不退出；退出是 Ctrl+Q。
+func TestCtrlCAndQ(t *testing.T) {
 	a := newTestApp(&fakeBackend{})
-	layout(a, 100, 30)
-
-	// 按 allTabs 绕一圈回到起点：页序变了也不用改测试
-	for i := 1; i <= len(allTabs); i++ {
-		want := allTabs[i%len(allTabs)]
-		a.handle(event{kind: evKey, key: keyTab})
-		if a.st.tab != want {
-			t.Fatalf("第 %d 次 Tab 应切到 %s，实际 %s", i, want.label(), a.st.tab.label())
-		}
-		// 进入设置页会自动聚焦 API Key，此时 Tab 的语义变成"换输入框"
-		// （见 TestTabMovesFocusWhileEditingSettings），要离开就先 Esc 取消聚焦
-		if a.st.tab == tabSettings {
-			a.handle(event{kind: evKey, key: keyEsc})
-		}
+	if a.handle(event{kind: evKey, key: keyCtrlC}) {
+		t.Fatal("Ctrl+C 不该退出（它是复制键）")
 	}
-	if a.st.tab != tabChat {
-		t.Fatalf("绕一圈后应回到聊天页，实际 %s", a.st.tab.label())
-	}
-}
-
-// prevTab 返回 allTabs 里某一页的前一页，避免测试写死页序。
-func prevTab(t tabKind) tabKind {
-	for i, v := range allTabs {
-		if v == t {
-			return allTabs[(i-1+len(allTabs))%len(allTabs)]
-		}
-	}
-	return allTabs[0]
-}
-
-// 切到设置页时，底部提示必须换成这一页自己的状态，
-// 否则上一个页面的提示会一直挂着，看起来像刚在这里发生过。
-func TestSettingsTabShowsOwnStatus(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.st.provider = "ollama"
-
-	// 路径一：键盘切页（从设置页的前一页按 Tab 过来）
-	a.setTab(prevTab(tabSettings))
-	a.handle(event{kind: evKey, key: keyTab})
-	if a.st.tab != tabSettings {
-		t.Fatalf("应切到设置页，实际 %v", a.st.tab)
-	}
-	if !strings.Contains(a.st.status, "ollama") {
-		t.Fatalf("设置页底部应显示 provider，实际 %q", a.st.status)
-	}
-
-	// 路径二：鼠标点标签，两条路必须一致
-	a.setTab(tabChat)
-	layout(a, 100, 30)
-	x, y := findBox(t, a, "tab:settings")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-	if a.st.tab != tabSettings {
-		t.Fatalf("点击标签应切到设置页，实际 %v", a.st.tab)
-	}
-	if !strings.Contains(a.st.status, "ollama") {
-		t.Fatalf("点击切页后底部也应显示 provider，实际 %q", a.st.status)
-	}
-}
-
-func TestCtrlCQuits(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	if !a.handle(event{kind: evKey, key: keyCtrlC}) {
-		t.Fatal("Ctrl+C 应请求退出")
+	if !a.handle(event{kind: evKey, key: keyCtrlQ}) {
+		t.Fatal("Ctrl+Q 应请求退出")
 	}
 }
 
@@ -1718,392 +1217,26 @@ func TestParseSGRMouse(t *testing.T) {
 // 后端数据解析
 // ---------------------------------------------------------------------------
 
-func TestManifestReadFailureIsVisible(t *testing.T) {
+// 读不到 manifest 的目录不该被界面静静跳过。
+//
+// 用例本身搬去了插件页（plugins/plugin-manager/panel_test.go 里那一份会
+// 把"读不出、拒绝启停与删除"整页画出来）；界面这边只保留它仍要负责的那一段：
+// 扫目录时不能因为一份 manifest 坏了就整份失败 —— 其余插件还得能认出来。
+func TestBrokenManifestSkipsOnlyItself(t *testing.T) {
 	a := newTestApp(&fakeBackend{})
-	a.st.plugins = []pluginInfo{{ID: "com.broken", ReadErr: "读取失败: access denied"}}
-	a.st.tab = tabPlugins
-	a.st.selectedPlugin = 0
+	a.st.plugins = []pluginInfo{
+		{ID: "com.broken", ReadErr: "读取失败: access denied", Dir: "broken.plugin"},
+		{ID: "com.official.workspace", Dir: "workspace.plugin",
+			Provides: []string{"ui.page.workspace.v1"}, Alive: []string{"ui.page.workspace.v1"}},
+	}
 	layout(a, 120, 34)
 
-	frame := a.canv.frame()
-	if !strings.Contains(frame, "读取失败") {
-		t.Fatal("读不到 manifest 的插件必须显式提示，不能静静消失")
-	}
-	if !strings.Contains(frame, "com.broken") {
-		t.Fatal("读不到 manifest 也要把目录名显示出来")
+	// 坏的那份不影响好的那份被认出来（标签栏上该出现它自带的那一页）
+	if got := pageServices(a.st.plugins); len(got) != 1 || got[0] != "ui.page.workspace.v1" {
+		t.Fatalf("坏 manifest 不该影响其它插件被认出来，实际 %v", got)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 设置页：粘贴不该被当成导航，输入不该没有落点
-// ---------------------------------------------------------------------------
-
-// 没聚焦任何输入框时打字，也要落到 API Key 上 ——
-// 用户进设置页就是来粘密钥的，不该因为"没先点一下输入框"而毫无反应。
-func TestTypingOnSettingsLandsOnApiKey(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-	a.st.focus = ""
-
-	a.handle(event{kind: evKey, key: keyRune, r: 'k'})
-	if got := a.fieldValue("apiKey"); got != "k" {
-		t.Fatalf("没聚焦时输入应落到 API Key，实际 %q", got)
-	}
-}
-
-// 粘贴内容里混进制表符/换行时，绝不能触发"切页"或"发送"。
-func TestPastedControlCharsDoNotSwitchPages(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-
-	// 用户抱怨的现象：粘一次密钥，界面被弹回聊天页
-	a.handle(event{kind: evKey, key: keyRune, r: '\t', paste: true})
-	a.handle(event{kind: evKey, key: keyRune, r: '\n', paste: true})
-	if a.st.tab != tabSettings {
-		t.Fatalf("粘贴里的控制字符不该切页，实际跳到了 %v 页", a.st.tab)
-	}
-
-	// 正常字符照样要进输入框
-	a.handle(event{kind: evKey, key: keyRune, r: 's', paste: true})
-	a.handle(event{kind: evKey, key: keyRune, r: 'k', paste: true})
-	if got := a.fieldValue("apiKey"); got != "sk" {
-		t.Fatalf("粘贴的字符应进 API Key 框，实际 %q", got)
-	}
-}
-
-// 正在编辑时 Tab 用来换输入框，而不是切页。
-func TestTabMovesFocusWhileEditingSettings(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-	if a.st.focus != "apiKey" {
-		t.Fatalf("切到设置页应自动聚焦 API Key（省一次点击），实际 %q", a.st.focus)
-	}
-
-	a.handle(event{kind: evKey, key: keyTab})
-	if a.st.tab != tabSettings {
-		t.Fatal("编辑状态下按 Tab 不该切页")
-	}
-	if a.st.focus == "apiKey" {
-		t.Fatal("Tab 应把焦点移到下一个控件")
-	}
-
-	// 取消聚焦后，Tab 才恢复成切页
-	a.st.focus = ""
-	a.handle(event{kind: evKey, key: keyTab})
-	if a.st.tab != tabChat {
-		t.Fatalf("取消聚焦后 Tab 应切页，实际 %v", a.st.tab)
-	}
-}
-
-// 点一下服务，地址和模型都要自动填好，焦点直接送到 API Key。
-func TestPresetFillsEverythingAndFocusesKey(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-	layout(a, 120, 40)
-
-	x, y := findBox(t, a, "preset:deepseek")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: x, Y: y, Press: true}})
-
-	if got := a.fieldValue("baseUrl"); got != "https://api.deepseek.com/v1" {
-		t.Fatalf("预设应自动填好地址，实际 %q", got)
-	}
-	if got := a.fieldValue("model"); got != "deepseek-chat" {
-		t.Fatalf("预设应自动填好默认模型，实际 %q", got)
-	}
-	if a.st.provider != "openai" {
-		t.Fatalf("DeepSeek 走 OpenAI 兼容接口，provider 应为 openai，实际 %q", a.st.provider)
-	}
-	if a.st.focus != "apiKey" {
-		t.Fatalf("选完服务焦点应在 API Key 上，实际 %q", a.st.focus)
-	}
-	if len(a.st.modelList) == 0 {
-		t.Fatal("预设应带出可点选的默认模型")
-	}
-	if !a.st.statusOK || !strings.Contains(a.st.status, "粘贴") {
-		t.Fatalf("状态栏应告诉用户下一步是粘贴密钥，实际 %q", a.st.status)
-	}
-
-	// 本地 Ollama 不需要密钥，提示要说清楚
-	layout(a, 120, 40)
-	ox, oy := findBox(t, a, "preset:ollama")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: ox, Y: oy, Press: true}})
-	if a.st.provider != "ollama" {
-		t.Fatalf("本地预设的 provider 应为 ollama，实际 %q", a.st.provider)
-	}
-	if !strings.Contains(a.st.status, "不需要密钥") {
-		t.Fatalf("应说明 Ollama 不需要密钥，实际 %q", a.st.status)
-	}
-}
-
-// 「获取可用模型」把服务端返回的清单变成可点选项。
-func TestFetchModelsThenPickOne(t *testing.T) {
-	fb := &fakeBackend{}
-	seed(fb)
-	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	a.st.modelList = nil
-	layout(a, 120, 40)
-
-	bx, by := findBox(t, a, "btn:getmodels")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	var out outcome
-	select {
-	case out = <-a.results:
-	case <-time.After(2 * time.Second):
-		t.Fatal("没有等到模型列表结果")
-	}
-	a.applyOutcome(out)
-
-	fb.mu.Lock()
-	calls := fb.modelCalls
-	fb.mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("应调用一次 listModels，实际 %d", calls)
-	}
-	if len(a.st.modelList) != 2 {
-		t.Fatalf("应拿到 2 个模型，实际 %d", len(a.st.modelList))
-	}
-
-	layout(a, 120, 40)
-	mx, my := findBox(t, a, "model:deepseek-reasoner")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: mx, Y: my, Press: true}})
-	if got := a.fieldValue("model"); got != "deepseek-reasoner" {
-		t.Fatalf("点模型应写进输入框，实际 %q", got)
-	}
-}
-
-// 选完服务、粘完密钥、点保存：四项参数要一起送出去。
-func TestSaveAfterPresetSendsAllFields(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	a.applyPreset("deepseek")
-	a.insertRune('s', true)
-	a.insertRune('k', true)
-	a.insertRune('-', true)
-	a.insertRune('x', true)
-
-	layout(a, 120, 40)
-	bx, by := findBox(t, a, "btn:save")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	waitFor(t, "保存被调用", func() bool {
-		n, _, _, _ := fb.snapshot()
-		return n == 1
-	})
-	_, _, _, saved := fb.snapshot()
-	want := []string{"openai", "https://api.deepseek.com/v1", "deepseek-chat", "sk-x"}
-	for i := range want {
-		if saved[i] != want[i] {
-			t.Fatalf("第 %d 项应为 %q，实际 %q（全部：%v）", i, want[i], saved[i], saved)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 括号粘贴：把"粘贴"和"逐键输入"分开
-// ---------------------------------------------------------------------------
-
-func TestBracketedPasteParsing(t *testing.T) {
-	seq := "\033[200~sk-abc\t\n\033[201~"
-	p := &eventParser{}
-	var evs []event
-	for i := 0; i < len(seq); i++ {
-		evs = append(evs, p.feed(seq[i])...)
-	}
-
-	if len(evs) != 8 {
-		t.Fatalf("sk-abc\\t\\n 应解析出 8 个字符事件，实际 %d：%+v", len(evs), evs)
-	}
-	for i, ev := range evs {
-		if !ev.paste {
-			t.Fatalf("第 %d 个事件应带 paste 标记：%+v", i, ev)
-		}
-	}
-	if evs[0].r != 's' || evs[6].r != '\t' || evs[7].r != '\n' {
-		t.Fatalf("字符顺序不对：%+v", evs)
-	}
-
-	// 真正的 Tab 键必须仍然是 keyTab，否则设置页就没法用 Tab 换输入框了
-	p2 := &eventParser{}
-	real := p2.feed('\t')
-	if len(real) != 1 || real[0].key != keyTab || real[0].paste {
-		t.Fatalf("真正的 Tab 应解析为 keyTab，实际 %+v", real)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 保存密钥：不能"看起来消失了"
-// ---------------------------------------------------------------------------
-
-// 读配置回来必须真的写进输入框。
-// 曾经这里用 range 遍历切片改字段 —— 改的是元素副本，等于什么都没做。
-func TestApplyLLMPopulatesFields(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.applyLLM(llmConfig{
-		Provider: "openai",
-		BaseURL:  "https://api.deepseek.com/v1",
-		Model:    "deepseek-chat",
-		APIKey:   "sk-t****cdef",
-	}, true)
-
-	if got := a.fieldValue("baseUrl"); got != "https://api.deepseek.com/v1" {
-		t.Fatalf("地址没被写进输入框：%q", got)
-	}
-	if got := a.fieldValue("model"); got != "deepseek-chat" {
-		t.Fatalf("模型没被写进输入框：%q", got)
-	}
-	if f := a.st.field("apiKey"); f == nil || !strings.Contains(f.hint, "sk-t****cdef") {
-		t.Fatal("密钥框应提示「已配置（打码）」")
-	}
-	if a.st.presetKey != "deepseek" {
-		t.Fatalf("应按地址还原服务选中状态，实际 %q", a.st.presetKey)
-	}
-	if len(a.st.modelList) == 0 {
-		t.Fatal("应带出该服务可点选的模型")
-	}
-}
-
-// 后台刷新（启动加载、保存后回读）不许冲掉用户正在输入的内容。
-func TestBackgroundRefreshDoesNotClobberTyping(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-	a.insertRune('s', false)
-	a.insertRune('k', false)
-
-	a.applyLLM(llmConfig{
-		Provider: "openai",
-		BaseURL:  "https://api.openai.com/v1",
-		Model:    "gpt-4o-mini",
-		APIKey:   "sk-o****1234",
-	}, true)
-
-	if got := a.fieldValue("apiKey"); got != "sk" {
-		t.Fatalf("后台刷新把正在输入的密钥冲掉了：%q", got)
-	}
-}
-
-// 保存失败时，密钥必须留在输入框里 —— 否则用户要重新粘一遍。
-func TestSaveFailureKeepsEnteredKey(t *testing.T) {
-	fb := &fakeBackend{saveEr: fmt.Errorf("network down")}
-	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	a.applyPreset("deepseek")
-	for _, r := range "sk-abc" {
-		a.insertRune(r, false)
-	}
-	layout(a, 120, 40)
-
-	bx, by := findBox(t, a, "btn:save")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	var res outcome
-	select {
-	case res = <-a.results:
-	case <-time.After(2 * time.Second):
-		t.Fatal("没等到保存结果")
-	}
-	a.applyOutcome(res)
-
-	if got := a.fieldValue("apiKey"); got != "sk-abc" {
-		t.Fatalf("保存失败时密钥应留着让用户重试，实际 %q", got)
-	}
-	if a.st.statusOK {
-		t.Fatal("保存失败时状态栏不该显示成功")
-	}
-}
-
-// 保存成功：清掉明文，但必须留下「已配置 ****」的确认，并把焦点移开。
-// 用户报的就是这条：点了保存，输入框空了，看不出到底存没存上。
-func TestSaveSuccessClearsKeyButShowsConfirmation(t *testing.T) {
-	fb := &fakeBackend{}
-	a := newTestApp(fb)
-	a.setTab(tabSettings)
-	a.applyPreset("deepseek")
-	for _, r := range "sk-abcdef1234" {
-		a.insertRune(r, false)
-	}
-	layout(a, 120, 40)
-
-	bx, by := findBox(t, a, "btn:save")
-	a.handle(event{kind: evMouse, mouse: mouseEvent{X: bx, Y: by, Press: true}})
-
-	var res outcome
-	select {
-	case res = <-a.results:
-	case <-time.After(2 * time.Second):
-		t.Fatal("没等到保存结果")
-	}
-	if res.kind != "saved" {
-		t.Fatalf("第一个结果应是 saved，实际 %q", res.kind)
-	}
-	a.applyOutcome(res)
-
-	f := a.st.field("apiKey")
-	if f == nil {
-		t.Fatal("找不到密钥字段")
-	}
-	if f.value != "" {
-		t.Fatalf("保存成功后不该继续显示明文，实际 %q", f.value)
-	}
-	if !strings.Contains(f.hint, "sk-a****1234") {
-		t.Fatalf("应留下打码确认，实际 %q", f.hint)
-	}
-	if a.st.focus == "apiKey" {
-		t.Fatal("焦点应移开，否则用户盯着空框以为白填了")
-	}
-	if !a.st.statusOK {
-		t.Fatalf("状态栏应显示保存成功，实际 %q", a.st.status)
-	}
-
-	// 关键：这个提示必须真的能看见
-	layout(a, 120, 40)
-	if !strings.Contains(a.canv.frame(), "sk-a****1234") {
-		t.Fatal("打码确认没有渲染到界面上")
-	}
-}
-
-// 保存后的配置回读不许顶掉保存确认 —— 否则用户永远看不到「已写入」。
-func TestQuietReloadKeepsSaveConfirmation(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.setTab(tabSettings)
-
-	a.applyOutcome(outcome{
-		kind:   "saved",
-		note:   "已保存 4 项配置 · 密钥 sk-a****1234 已写入，界面不再显示明文",
-		apiKey: "sk-abcdef1234",
-	})
-	if !strings.Contains(a.st.status, "已写入") {
-		t.Fatalf("保存后应显示写入确认，实际 %q", a.st.status)
-	}
-
-	// 紧接着的回读（quiet=true）：不许覆盖
-	a.applyOutcome(outcome{kind: "llm", cfg: &llmConfig{Provider: "openai"}, quiet: true})
-	if !strings.Contains(a.st.status, "已写入") {
-		t.Fatalf("回读把写入确认顶掉了，实际 %q", a.st.status)
-	}
-
-	// 启动时的加载（quiet=false）才更新状态栏
-	a.applyOutcome(outcome{kind: "llm", cfg: &llmConfig{Provider: "ollama"}})
-	if !strings.Contains(a.st.status, "ollama") {
-		t.Fatalf("启动时的加载应更新状态栏，实际 %q", a.st.status)
-	}
-}
-
-// 空的密钥框即使在聚焦状态也要显示提示。
-func TestEmptyKeyFieldShowsHintEvenWhenFocused(t *testing.T) {
-	a := newTestApp(&fakeBackend{})
-	a.st.fields[2].hint = "已配置 sk-a****1234（留空=不改动）"
-	a.setTab(tabSettings) // 焦点落在 apiKey
-	layout(a, 120, 40)
-
-	if !strings.Contains(a.canv.frame(), "sk-a****1234") {
-		t.Fatal("聚焦的空输入框也要显示「已配置」提示")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // 链式对话：点得到、翻得动、旧时间线不消失
 // ---------------------------------------------------------------------------
 
@@ -2147,7 +1280,7 @@ func TestConvSendRendersClickableBoxes(t *testing.T) {
 	layout(a, 110, 34)
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	layout(a, 110, 34)
 
@@ -2174,7 +1307,7 @@ func TestConvEditMakesNewVersionAndKeepsOldOne(t *testing.T) {
 	layout(a, 110, 34)
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	layout(a, 110, 34)
 
@@ -2192,7 +1325,7 @@ func TestConvEditMakesNewVersionAndKeepsOldOne(t *testing.T) {
 		a.handle(event{kind: evKey, key: keyBackspace})
 	}
 	typeString(a, "换个问法")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	layout(a, 110, 34)
 
@@ -2221,7 +1354,7 @@ func TestConvPagerRestoresOldTimeline(t *testing.T) {
 	layout(a, 110, 34)
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	layout(a, 110, 34)
 
@@ -2285,14 +1418,14 @@ func TestConvSwitchSessionRestoresItsMessages(t *testing.T) {
 	a := newConvApp(t, fb)
 
 	typeString(a, "第一条会话")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	first := a.st.sessID
 
 	a.newSession()
 	drain(t, a)
 	typeString(a, "第二条会话")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 
 	a.switchSession(first)
@@ -2312,7 +1445,7 @@ func TestConvSharePanelExportsMarkdown(t *testing.T) {
 	layout(a, 110, 34)
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	drain(t, a)
 	layout(a, 110, 34)
 
@@ -2353,9 +1486,9 @@ func TestConvOffFallsBackToLinearChat(t *testing.T) {
 	}
 
 	typeString(a, "你好")
-	a.handle(event{kind: evKey, key: keyEnter})
+	sendNow(t, a)
 	waitFor(t, "走降级链路", func() bool {
-		_, _, chats, _ := fb.snapshot()
+		chats := fb.snapshot()
 		return len(chats) == 1
 	})
 	if len(fb.convSends) != 0 {
@@ -2413,9 +1546,6 @@ func TestHitboxesCoverTheirLabels(t *testing.T) {
 		seed(fb)
 		a := newTestApp(fb)
 		a.st.plugins = fb.plugins
-		a.st.wsPath = "/tmp/proj"
-		a.st.wsParent = "/tmp"
-		a.st.wsEntries = []dirEntry{{Name: "src", Dir: true}, {Name: "README.md", Size: 1024}}
 		a.st.sessID = "s1"
 		a.st.sessions = []sessionInfo{{id: "s1", name: "会话 1", nodes: 2}}
 		a.st.msgs = []msgView{
@@ -2430,19 +1560,7 @@ func TestHitboxesCoverTheirLabels(t *testing.T) {
 			assertHitboxesAligned(t, a, where+" "+tab.label())
 		}
 
-		// 选中插件才有操作行
-		a.st.tab = tabPlugins
-		a.selectPlugin(0)
-		layout(a, sz[0], sz[1])
-		assertHitboxesAligned(t, a, where+" 插件详情")
-
-		// 删除的二次确认：确认与取消是两个相邻按钮
-		a.st.confirmDelete = true
-		layout(a, sz[0], sz[1])
-		assertHitboxesAligned(t, a, where+" 删除确认")
-
 		// 分享面板的三个按钮
-		a.st.confirmDelete = false
 		a.st.tab = tabChat
 		a.st.shareOpen = true
 		layout(a, sz[0], sz[1])

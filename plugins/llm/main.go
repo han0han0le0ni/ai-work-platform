@@ -78,17 +78,32 @@ type ToolSpec struct {
 // LLM 实现 plugin.Plugin。
 type LLM struct {
 	ctx *plugin.Context
+
+	// panel 是「模型接入」那一页的界面状态（见 panel.go）。
+	//
+	// 这一页住在插件自己身上：连哪个平台、密钥去哪申请、本机应用默认端口是多少，
+	// 全是 LLM 领域的知识 —— 界面不该存第二份。
+	panel llmPanel
 }
 
 // Activate 注册 llm.v1。
 func (l *LLM) Activate(ctx *plugin.Context) error {
 	l.ctx = ctx
+	l.panel = newLLMPanel()
 	if err := ctx.Provide(serviceName, map[string]any{
 		"description": "把消息与工具定义翻译成模型调用，返回文本与工具调用",
-		"methods":     []string{"chat", "models", "providers", "configure", "ping"},
+		"methods":     []string{"chat", "models", "providers", "configure", "ping", "discover"},
 		"providers":   []string{"mock", "openai", "ollama"},
 	}); err != nil {
 		return err
+	}
+
+	// 自带界面：把「模型接入」挂在 UI 插件上。
+	if err := ctx.Provide(panelService, map[string]any{
+		"description": "模型接入页：平台预设 / 本机扫描 / 密钥 / 协议 / 识图（llm 自己渲染）",
+		"methods":     []string{"list", "render", "action", "key"},
+	}); err != nil {
+		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
 	}
 
 	cfg := l.settings()
@@ -104,6 +119,9 @@ func (l *LLM) Activate(ctx *plugin.Context) error {
 
 // Handle 处理 core.invoke。
 func (l *LLM) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == panelService {
+		return l.handlePanel(method, args)
+	}
 	if service != serviceName {
 		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "LLM 插件不提供服务 %s", service)
 	}
@@ -114,6 +132,9 @@ func (l *LLM) Handle(service, method string, args json.RawMessage) (any, error) 
 		return l.models(args)
 	case "providers":
 		return l.providersReport(), nil
+	case "discover":
+		// 扫描本机常见 AI 端点：界面「本地」那一页靠它回答"这台机器上有没有 AI"。
+		return l.discover(args)
 	case "configure":
 		return l.configure(args)
 	case "ping":

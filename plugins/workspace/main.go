@@ -1,18 +1,18 @@
 // Command workspace 是官方工作区文件插件，提供 workspace.v1。
 //
-// 和 fs-tool 的区别：**fs-tool 是按绝对路径读单个文件的示例，这里是"先指定一个文件夹，
-// 然后在这个文件夹里随便折腾"**。所有操作都经核心的能力代理执行，插件自己不碰文件系统。
+// 和 fs-tool 的区别：**fs-tool 是按绝对路径读单个文件的示例，这里是"指定一个落脚文件夹，
+// 然后整机哪里都能折腾"**。所有操作都经核心的能力代理执行，插件自己不碰文件系统。
 //
-// 围栏是它的核心价值：一旦指定了工作目录，所有路径都被锁在这个目录里 ——
-// 传 ../.. 也好、绝对路径也好，只要落在外面就拒绝。
-// 这样"给某个插件一个文件夹"就成了一件可以放心做的事，而不是把整块盘交出去。
+// 工作目录（root）只是**相对路径的落脚点**：相对路径拼到它下面，绝对路径原样使用 ——
+// 也就是说 C:\ D:\ E:\ 任意位置都能读写，不再有盘符 / 越界围栏。
+// 唯一还兜底挡住的是核心运行时目录本身（由核心的能力代理护栏负责，删它或它的一级子目录会被拒）。
 //
 // 用法（终端界面的 /tool，或别的插件经 core.invoke 调用）：
 //
-//	/tool workspace.v1 setRoot {"path":"E:\\my-project"}
+//	/tool workspace.v1 setRoot {"path":"E:\\my-project"}   # 可选：只决定相对路径落在哪
 //	/tool workspace.v1 tree
 //	/tool workspace.v1 write  {"path":"notes/a.txt","content":"hello"}
-//	/tool workspace.v1 read   {"path":"notes/a.txt"}
+//	/tool workspace.v1 read   {"path":"C:\\Users\\me\\Desktop\\a.txt"}
 //	/tool workspace.v1 delete {"path":"notes","recursive":true}
 package main
 
@@ -42,8 +42,20 @@ const (
 type Workspace struct {
 	ctx *plugin.Context
 
+	// api 是界面这一页要用到的那几样能力（生产上注入的就是 ctx）。
+	//
+	// 把它单独拎出来只为一件事：单测里能换成假的，不必为了验证"点了目录会
+	// 发生什么"去连真磁盘。
+	api panelCtx
+
 	// root 是当前指定的工作目录（绝对路径）。空表示还没指定。
 	root string
+
+	// panel 是这一页的界面状态（见 panel.go）。
+	//
+	// 界面状态数据放在插件自己这里，不放在 UI 插件里 —— 这是"插件自带界面"
+	// 的全部意义：UI 插件只借一块地方给它画，其余一概不管。
+	panel wsPanel
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +64,7 @@ type Workspace struct {
 
 func (w *Workspace) Activate(ctx *plugin.Context) error {
 	w.ctx = ctx
+	w.api = ctx
 
 	// 上次指定的工作目录要接着用：它是用户的选择，不该每次重启都要重设一遍
 	if raw, err := ctx.GetConfig("root"); err == nil && len(raw) > 0 {
@@ -71,6 +84,17 @@ func (w *Workspace) Activate(ctx *plugin.Context) error {
 		return err
 	}
 
+	// 自带界面：把"选工作目录"这一页挂在 UI 插件上。
+	//
+	// 插件提供 ui.panel.v1 就代表"我有一页自己的界面" —— UI 插件会来问
+	// list / render / action，其余什么都不需要知道。
+	if err := ctx.Provide(panelService, map[string]any{
+		"description": "工作区自带的一页界面：浏览目录、挑工作目录（插件自己渲染）",
+		"methods":     []string{"list", "render", "action", "key"},
+	}); err != nil {
+		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
+	}
+
 	ctx.Log("info", "工作区插件已就绪（workspace.v1）", map[string]any{
 		"root":        firstNonEmpty(w.root, "（尚未指定）"),
 		"permissions": ctx.Permissions,
@@ -79,6 +103,9 @@ func (w *Workspace) Activate(ctx *plugin.Context) error {
 }
 
 func (w *Workspace) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == panelService {
+		return w.handlePanel(method, args)
+	}
 	if service != serviceName {
 		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "工作区插件不提供服务 %s", service)
 	}
@@ -132,7 +159,7 @@ func (w *Workspace) showRoot() (any, error) {
 }
 
 func hintWhenUnset() string {
-	return "尚未指定工作目录：先调用 setRoot {\"path\":\"<文件夹>\"}"
+	return "相对路径需要先设置工作目录：setRoot {\"path\":\"<文件夹>\"}（绝对路径可直接使用）"
 }
 
 // setRoot 指定工作目录。
@@ -146,38 +173,48 @@ func (w *Workspace) setRoot(args json.RawMessage) (any, error) {
 	if err := decode(args, &in); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(in.Path) == "" {
-		return nil, plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
-	}
-
-	raw, err := w.ctx.FSList(in.Path)
+	root, err := w.setRootPath(in.Path)
 	if err != nil {
-		return nil, plugin.Errorf(plugin.CodeInvalidParams,
-			"不能把 %q 作为工作目录：%v", in.Path, err)
+		return nil, err
+	}
+	return map[string]any{"root": root, "set": true}, nil
+}
+
+// setRootPath 是 setRoot 的实体：给路径、设工作目录、返回生效后的绝对路径。
+//
+// 单独抽出来是因为有两处调用：一次 RPC（别的插件 / 命令行），一次自带界面上的按钮。
+// 界面那边不该为了用一下自己的方法而去拼一份 JSON。
+func (w *Workspace) setRootPath(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", plugin.Errorf(plugin.CodeInvalidParams, "缺少 path")
+	}
+	raw, err := w.api.FSList(path)
+	if err != nil {
+		return "", plugin.Errorf(plugin.CodeInvalidParams,
+			"不能把 %q 作为工作目录：%v", path, err)
 	}
 	var out struct {
 		Path string `json:"path"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, plugin.Errorf(plugin.CodeInternalError, "解析目录列表失败: %v", err)
+		return "", plugin.Errorf(plugin.CodeInternalError, "解析目录列表失败: %v", err)
 	}
 	if out.Path == "" {
-		return nil, plugin.Errorf(plugin.CodeInternalError, "核心未返回目录路径")
+		return "", plugin.Errorf(plugin.CodeInternalError, "核心未返回目录路径")
 	}
 
 	w.root = out.Path
-	if err := w.ctx.SetConfig("root", out.Path); err != nil {
-		return nil, plugin.Errorf(plugin.CodeInternalError, "保存工作目录失败: %v", err)
+	if err := w.api.SetConfig("root", out.Path); err != nil {
+		return "", plugin.Errorf(plugin.CodeInternalError, "保存工作目录失败: %v", err)
 	}
-	w.ctx.Log("info", "工作目录已设置", map[string]any{"root": out.Path})
-	return map[string]any{"root": out.Path, "set": true}, nil
+	w.api.Log("info", "工作目录已设置", map[string]any{"root": out.Path})
+	return w.root, nil
 }
 
 // browse 列出任意目录，用来**挑选**工作目录。
 //
-// 它是唯一不受围栏限制的方法，而且只读目录名、不读文件内容 ——
-// 在 setRoot 之前总得有个办法看看盘上有什么，否则用户只能靠猜路径。
-// 一旦 setRoot，真正的文件操作（list / read / write / ...）就全部锁进围栏。
+// 它只读目录名、不读文件内容，空路径时交给核心的默认目录（core.json 配了 fsRoot
+// 就是 fsRoot，否则是运行时目录），并额外给出"上一级"的落点，方便界面顺着走。
 func (w *Workspace) browse(args json.RawMessage) (any, error) {
 	var in struct {
 		Path string `json:"path"`
@@ -224,40 +261,29 @@ func (w *Workspace) browse(args json.RawMessage) (any, error) {
 }
 
 // ---------------------------------------------------------------------------
-// 路径：围栏的全部实现都在这里
+// 路径：相对路径落工作目录，绝对路径直通全盘
 // ---------------------------------------------------------------------------
 
-// resolve 把用户给的路径解析成绝对路径，并确保它落在工作目录内。
+// resolve 把用户给的路径解析成绝对路径。
 //
-// 这是本插件的安全边界：相对路径一律拼到 root 下，绝对路径必须本来就在 root 里，
-// 用 .. 或换盘符绕出去的请求一律拒绝。
+// 相对路径以工作目录（root）为基准拼出来；绝对路径原样使用 ——
+// 整机任意位置（含 C/D/E 等所有盘符）都能读写，这里不再做盘符 / 越界围栏。
+// 工作目录只是相对路径的落脚点；没指定它时，只有绝对路径可用。
 func (w *Workspace) resolve(p string) (string, error) {
+	s := strings.TrimSpace(p)
+	if s == "" {
+		if w.root == "" {
+			return "", plugin.Errorf(plugin.CodeInvalidParams, hintWhenUnset())
+		}
+		return filepath.Clean(w.root), nil
+	}
+	if filepath.IsAbs(s) {
+		return filepath.Clean(s), nil
+	}
 	if w.root == "" {
 		return "", plugin.Errorf(plugin.CodeInvalidParams, hintWhenUnset())
 	}
-	abs := w.root
-	if s := strings.TrimSpace(p); s != "" {
-		if filepath.IsAbs(s) {
-			abs = filepath.Clean(s)
-		} else {
-			abs = filepath.Join(w.root, s)
-		}
-	}
-	return w.confine(abs)
-}
-
-// confine 校验绝对路径没有越出工作目录。
-func (w *Workspace) confine(abs string) (string, error) {
-	abs = filepath.Clean(abs)
-	rel, err := filepath.Rel(w.root, abs)
-	if err != nil {
-		return "", plugin.Errorf(plugin.CodePermissionDenied, "路径越界：%s 不在工作目录 %s 内", abs, w.root)
-	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
-		return "", plugin.Errorf(plugin.CodePermissionDenied,
-			"路径越界：%s 不在工作目录 %s 内（不允许用 .. 逃出去）", abs, w.root)
-	}
-	return abs, nil
+	return filepath.Clean(filepath.Join(w.root, s)), nil
 }
 
 // rel 返回路径相对工作目录的显示形式（用于输出，读起来比绝对路径短）。
@@ -316,7 +342,7 @@ func (w *Workspace) list(args json.RawMessage) (any, error) {
 
 // listOne 列一层目录。
 func (w *Workspace) listOne(dir string) ([]item, error) {
-	raw, err := w.ctx.FSList(dir)
+	raw, err := w.api.FSList(dir)
 	if err != nil {
 		return nil, err
 	}

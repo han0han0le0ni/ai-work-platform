@@ -45,16 +45,34 @@ type settings struct {
 }
 
 // Provider 实现 plugin.Plugin。
-type Provider struct{ ctx *plugin.Context }
+type Provider struct {
+	ctx *plugin.Context
+
+	// panel 是「文生图」配置页的界面状态（见 panel.go）。
+	//
+	// 这一页住在插件自己身上：用什么服务、密钥、模型、尺寸，全是 imagegen
+	// 自己的事，界面不该替它画、也不该认识它的字段名。
+	panel igPanel
+}
 
 func (p *Provider) Activate(ctx *plugin.Context) error {
 	p.ctx = ctx
+	p.panel = newIGPanel()
 	if err := ctx.Provide(serviceName, map[string]any{
 		"description": "文生图：prompt 进，图片路径出",
 		"methods":     []string{"generate", "configure", "providers", "registerTool"},
 	}); err != nil {
 		return err
 	}
+
+	// 自带界面：把「文生图」配置页挂在 UI 插件上。
+	if err := ctx.Provide(panelService, map[string]any{
+		"description": "文生图配置页：服务商 / 密钥 / 模型 / 尺寸（imagegen 自己渲染）",
+		"methods":     []string{"list", "render", "action", "key"},
+	}); err != nil {
+		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
+	}
+
 	ctx.Log("info", "生图插件已就绪", map[string]any{
 		"provider": p.settings().Provider, "model": p.settings().Model,
 		"hasKey": p.settings().APIKey != "",
@@ -65,6 +83,9 @@ func (p *Provider) Activate(ctx *plugin.Context) error {
 func (p *Provider) Deactivate() error { return nil }
 
 func (p *Provider) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == panelService {
+		return p.handlePanel(method, args)
+	}
 	switch method {
 	case "generate":
 		return p.generate(args)
@@ -124,41 +145,33 @@ func (p *Provider) pick(key string, envs ...string) string {
 }
 
 func defaultBaseURL(provider string) string {
-	if provider == "openai" || provider == "" {
-		return defaultOpenAIBase
+	if provider == "" {
+		provider = "openai"
+	}
+	if it, ok := presetByKey(provider); ok {
+		return it.BaseURL
 	}
 	return ""
 }
 
 func defaultModel(provider string) string {
-	switch provider {
-	case "wanx", "dashscope":
-		return "wanx-v1"
-	case "siliconflow":
-		return "Kwai-Kolors/Kolors"
-	case "zhipu", "bigmodel":
-		return "cogview-3"
-	default:
-		return "dall-e-3"
+	if it, ok := presetByKey(provider); ok {
+		return it.Model
 	}
+	return "dall-e-3"
 }
 
 func (p *Provider) providers() map[string]any {
 	s := p.settings()
+	avail := make([]map[string]any, 0, len(imagePresets))
+	for _, it := range imagePresets {
+		avail = append(avail, map[string]any{
+			"name": it.Key, "baseUrl": it.BaseURL, "model": it.Model, "note": it.Note,
+		})
+	}
 	return map[string]any{
-		"current": s.Provider,
-		"available": []map[string]any{
-			{"name": "openai", "baseUrl": defaultOpenAIBase, "model": "dall-e-3",
-				"note": "OpenAI 官方"},
-			{"name": "wanx", "baseUrl": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-				"model": "wanx-v1", "note": "阿里通义万相（国内直连）"},
-			{"name": "siliconflow", "baseUrl": "https://api.siliconflow.cn/v1",
-				"model": "Kwai-Kolors/Kolors", "note": "SiliconFlow 聚合（有免费额度）"},
-			{"name": "zhipu", "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
-				"model": "cogview-3", "note": "智谱 CogView"},
-			{"name": "local", "baseUrl": "http://127.0.0.1:7860/v1", "model": "sd",
-				"note": "本地 SD WebUI / ComfyUI 兼容层"},
-		},
+		"current":   s.Provider,
+		"available": avail,
 		"config": map[string]any{
 			"provider": s.Provider,
 			"baseUrl":  s.BaseURL,

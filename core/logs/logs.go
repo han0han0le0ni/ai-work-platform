@@ -111,6 +111,24 @@ func (l *Logger) PluginStderr(pluginID, line string) {
 	l.Write(pluginID, "stderr", line, nil)
 }
 
+// ClosePlugin 只关闭某一个插件的日志句柄。
+//
+// 热卸载插件时要用它：句柄是惰性打开、且默认一直持有的，不关掉的话
+// Windows 上 `logs/<id>.log` 删不掉，删除就得退回"重启后生效"。
+// 关掉之后日志当场就能删，卸载才算真的当场完成。
+func (l *Logger) ClosePlugin(pluginID string) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := sanitize(pluginID)
+	if f, ok := l.files[key]; ok {
+		_ = f.Close()
+		delete(l.files, key)
+	}
+}
+
 // Close 关闭所有句柄。
 func (l *Logger) Close() {
 	l.mu.Lock()

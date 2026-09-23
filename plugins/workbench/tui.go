@@ -3,31 +3,32 @@ package main
 import (
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"aiwork/sdk/go/plugin"
 )
 
 // backend 是界面需要的能力。抽成接口是为了能用假实现驱动整个主循环。
 type backend interface {
 	probeServices() []serviceStatus
 	scanPlugins() ([]pluginInfo, error)
-	// 启停与删除都要带目录名：目录里可能躺着两份 ID 相同的插件
-	// （例如一份 x.plugin、一份 x.plugin.disabled），只认 ID 会动到另一份上去。
-	setPluginEnabled(id, dir string, enabled bool) (string, error)
-	deletePlugin(id, dir string) (string, error)
 	wsBrowse(path string) (wsListing, error)
-	wsSetRoot(path string) (wsListing, error)
 	readAttachment(path string) (attachment, error)
 	readImageBytes(path string) ([]byte, error)
 	openPath(path string) (string, error)
-	loadAgentBudget() (steps int, unlimited bool, err error)
-	saveAgentBudget(steps int, unlimited bool) (string, error)
-	loadLLM() (llmConfig, error)
-	saveLLM(provider, baseURL, model, apiKey, visionModel string) (string, error)
-	testLLM() (string, error)
-	listModels(provider, baseURL, apiKey string) ([]string, string, error)
+	// 插件自带的页面（ui.page.*）。界面只借一块地方给它：问清单、要素材、
+	// 转发点击与按键 —— 至于页面上有什么、点了会怎样，这里一概不知道。
+	pageList(services []string) ([]pagePanel, error)
+	pageRender(svc, id string, w, h, scroll int) (plugin.PanelRender, error)
+	pageAction(svc, id, action, arg string) (string, error)
+	pageKey(svc, id, kind, text string) (pageKeyResult, error)
+	// 插件自带的浮窗（ui.widget.*）：问有哪些、要素材。位置归界面管，内容归插件。
+	widgetList(svc string) ([]plugin.WidgetInfo, error)
+	widgetRender(svc, id string) (plugin.WidgetRender, error)
+	widgetPos(svc, id string) (x, y int, fold bool)
+
 	chat(text string) (string, string, error)
 
 	// 链式对话（conversation.v1）。装了它，聊天页就是可回滚、可翻版本的消息树；
@@ -44,8 +45,6 @@ type backend interface {
 	convMarkdown(sessionID string) (string, error)
 	convExport(sessionID string) (string, error)
 
-	// 浮窗位置要写进插件配置，而界面自己没有 ctx、不碰存储：交给 backend。
-	saveFloat(x, y int, fold bool)
 	// 重启核心：插件的启停 / 删除都只做标记、标着"重启后生效"（规范 2.6），
 	// 得有个地方能按这一下。
 	restart() (string, error)
@@ -58,16 +57,6 @@ type convSnapshot struct {
 	sessions  []sessionInfo
 	msgs      []msgView
 	note      string // 插件给的提示（例如「末尾那条生成失败了，可以重新生成」）
-}
-
-// llmConfig 是 llm.v1 providers 返回的配置快照。
-type llmConfig struct {
-	Provider string
-	BaseURL  string
-	Model    string
-	APIKey   string // 打码后的值，界面永远拿不到明文
-	// VisionModel 是"带图片时改用哪个模型"；空 = 跟主模型一样。
-	VisionModel string
 }
 
 // wsListing 是一次目录浏览的结果（文件页用）。
@@ -91,25 +80,28 @@ type outcome struct {
 	err      error
 	services []serviceStatus
 	plugins  []pluginInfo
-	models   []string
-	cfg      *llmConfig
-	apiKey   string // 保存失败时把用户输入的密钥还回输入框
-	quiet    bool   // 回读配置时不覆盖底部状态
+	quiet    bool // 自动刷新不覆盖底部状态
 	ws       *wsListing
-	budget   *agentBudget
 	conv     *convSnapshot
 	att      *attachment
+
+	// 插件自带页面
+	pages    []pagePanel
+	pageKey  string  // 这次回来的是哪一份缓存键
+	pageReq  pageReq // 它是为多大地方、滚到哪儿要的
+	pageOut  plugin.PanelRender
+	pageNote string // 动作返回的一句话
 
 	// 缩略图读完之后回传的内容
 	thumbPath  string
 	thumbLines []string
 	thumbFail  bool
-}
 
-// agentBudget 是 agent.v1 的编排预算快照。
-type agentBudget struct {
-	Steps     int
-	Unlimited bool
+	// 插件自带浮窗（ui.widget.*）
+	widgetSvc   string
+	widgetInfos []plugin.WidgetInfo
+	widgetIdx   int
+	widgetOut   plugin.WidgetRender
 }
 
 // app 驱动整个界面。
@@ -129,6 +121,12 @@ type app struct {
 	stopInput func()
 	apply     chan func()
 	results   chan outcome
+
+	// pageKeys 是"送给插件页面的按键"队列。
+	//
+	// 必须是一条队列、一个消费者：两个并发的 RPC 谁先写进管道是不确定的，
+	// 各起一个 goroutine 打字就会串成乱码（见 startPageKeys）。
+	pageKeys chan pageKeyMsg
 
 	// rescanSeq 是防抖用的序号：每次插件状态变化都让它前进，
 	// 只有最后一个计时器真正去刷新（见 scheduleRescan）。
@@ -151,21 +149,6 @@ type app struct {
 	stopped chan struct{}
 }
 
-// defaultFields 是界面上的输入框集合。
-//
-// 抽成函数是必须的：测试里那份副本漏掉过一个新字段，结果文件页测试全绿而真机是空的。
-// 只有一份来源，才不会飘。
-func defaultFields() []formField {
-	return []formField{
-		{key: "baseUrl", label: "Base URL"},
-		{key: "model", label: "模型"},
-		{key: "visionModel", label: "识图模型"},
-		{key: "apiKey", label: "API Key", secret: true},
-		{key: "wsPath", label: "工作区"},
-		{key: "agentSteps", label: "工具上限"},
-	}
-}
-
 func newApp(term *terminal, plug backend, coreVersion, apiVersion, pluginID string) *app {
 	return &app{
 		plug: plug,
@@ -181,28 +164,25 @@ func newApp(term *terminal, plug backend, coreVersion, apiVersion, pluginID stri
 				role: "系统",
 				at:   nowHM(),
 				text: "工作台已就绪。\n" +
-					"· 上方标签可点击：聊天 / 插件 / 文件 / 设置\n" +
+					"· 上方标签可点击：聊天 / 插件 / 设置 / 角色，装了带界面的插件还会多出它自己的页\n" +
 					"· 每条消息都是一个框：框上有「修改 / 重新生成 / 分享」，下角的 ‹ n/n › 翻版本\n" +
 					"· 修改或重新生成会开出一条新时间线，旧的那条一条都不会删\n" +
 					"· 「插件」页可以点击每个插件看它的服务、权限、依赖",
 			}},
-			fields: defaultFields(),
-
-			// 浮窗还没被拖过：贴右上角（见 float.go 的 floatOrigin）
-			floatX: -1,
-			floatY: -1,
 		},
-		apply:   make(chan func(), 64),
-		results: make(chan outcome, 16),
-		done:    make(chan struct{}),
-		stopped: make(chan struct{}),
-		holdEOF: os.Getenv("AIWORK_UI_HOLD_ON_EOF") != "",
+		apply:    make(chan func(), 64),
+		results:  make(chan outcome, 16),
+		pageKeys: make(chan pageKeyMsg, 256),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		holdEOF:  os.Getenv("AIWORK_UI_HOLD_ON_EOF") != "",
 	}
 }
 
 // Start 进入事件循环（阻塞，应在 goroutine 中调用）。
 func (a *app) Start() {
 	a.events, a.stopInput = startInput(a.term, a.holdEOF)
+	a.startPageKeys()
 	defer a.Stop()
 
 	a.kickLoads()
@@ -244,6 +224,13 @@ func (a *app) post(fn func()) {
 // 启动时十几个插件会在两百毫秒内接连激活。每个事件都去扫一遍插件目录，
 // 就是十几次文件读取加几十次服务查找 —— 等安静下来再扫一次就够。
 const rescanDebounce = 300 * time.Millisecond
+
+// rescanInterval 是"周期兜底重扫"的间隔。
+//
+// 只补 plugin.deleted / plugin.state 事件盖不到的洞：直接删插件目录、或者事件
+// 在订阅之前就丢了。扫描本身很轻（读十几个 manifest + 探测服务），3 秒一次
+// 用户无感，却能让"删了却还赖着"的页面最多多活 3 秒。
+const rescanInterval = 3 * time.Second
 
 // scheduleRescan 在插件状态变化后安排一次快照刷新。
 //
@@ -306,6 +293,11 @@ func (a *app) PushNotice(text string) {
 func (a *app) loop() {
 	ticker := time.NewTicker(110 * time.Millisecond)
 	defer ticker.Stop()
+	// 周期兜底重扫：插件目录可能被"外部"改动（比如直接在文件系统里删了某个
+	// 插件的目录），那一下没有 plugin.deleted 事件，界面不会知道。每隔几秒
+	// 主动扫一次，最多延迟一个周期就能把消失插件的页面摘掉。
+	rescanTicker := time.NewTicker(rescanInterval)
+	defer rescanTicker.Stop()
 	defer close(a.stopped) // 退出已生效：外面可以安全地还原终端了
 
 	a.render()
@@ -336,6 +328,9 @@ func (a *app) loop() {
 				a.st.spinner++
 				a.render()
 			}
+
+		case <-rescanTicker.C:
+			a.scheduleRescan()
 		}
 	}
 }
@@ -346,37 +341,17 @@ func (a *app) kickLoads() {
 		a.results <- outcome{kind: "services", services: a.plug.probeServices()}
 	}()
 	go a.refreshPlugins()
-	go a.reloadLLM(false)
-	// 这三个内部各自起 goroutine；必须在这里同步调用 ——
+	// 内部各自起 goroutine；必须在这里同步调用 ——
 	// kickLoads 跑在主循环启动之前，界面状态只能由这一个 goroutine 碰。
 	a.loadConversation()
-	a.reloadBudget()
-	a.browseTo("") // 文件页先列出默认目录，切过去就能点
+	// 插件自带的页面：清单是从插件清单（manifest）里挑出来的，已经扫好了，
+	// 这里补上各页自报的标题。问不到也不要紧 —— 服务快照回来时会再补问一次。
+	a.loadPages()
 }
 
 func (a *app) refreshPlugins() {
 	ps, err := a.plug.scanPlugins()
 	a.results <- outcome{kind: "plugins", plugins: ps, err: err}
-}
-
-// reloadLLM 回读一次配置。
-//
-// quiet=true 时不覆盖底部状态：保存后紧接着回读，不能让「密钥已写入」的确认
-// 被「当前 provider」顶掉 —— 那正是用户看不出到底存没存上的原因。
-func (a *app) reloadLLM(quiet bool) {
-	cfg, err := a.plug.loadLLM()
-	a.results <- outcome{kind: "llm", cfg: &cfg, err: err, quiet: quiet}
-}
-
-// reloadBudget 回读 agent 的编排预算。
-func (a *app) reloadBudget() {
-	a.st.budgetBusy = true
-	go func() {
-		steps, unlimited, err := a.plug.loadAgentBudget()
-		a.results <- outcome{
-			kind: "budget", budget: &agentBudget{Steps: steps, Unlimited: unlimited}, err: err,
-		}
-	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -434,120 +409,132 @@ func (a *app) convRun(wait bool, fn func() (convSnapshot, error)) {
 
 func (a *app) applyOutcome(out outcome) {
 	switch out.kind {
-	case "budget":
-		a.st.budgetBusy = false
-		if out.err != nil {
-			a.st.budgetLoaded = false
-			a.st.budgetNote = "读取失败：" + out.err.Error()
-			return
-		}
-		a.st.budgetLoaded = true
-		a.st.budgetUnlimited = out.budget.Unlimited
-		if f := a.st.field("agentSteps"); f != nil && !f.dirty {
-			if out.budget.Unlimited {
-				f.value = ""
-				f.hint = "不限制"
-			} else {
-				f.value = fmt.Sprintf("%d", out.budget.Steps)
-				f.hint = ""
-			}
-		}
-		a.st.budgetNote = budgetSummary(*out.budget)
-
 	case "services":
 		a.st.services = out.services
 
 	case "plugins":
 		if out.err != nil {
-			a.st.status = "读取插件目录失败：" + out.err.Error()
-			a.st.statusOK = false
+			// 自动刷新失败不打扰用户：下一轮还会再扫，而且这影响的只是
+			// "标签栏能不能认出插件自带的那几页"，不影响手头正在做的事。
+			if !out.quiet {
+				a.st.status = "读取插件目录失败：" + out.err.Error()
+				a.st.statusOK = false
+			}
 			return
 		}
 		a.st.plugins = out.plugins
-		if a.st.selectedPlugin >= len(a.st.plugins) {
-			a.st.selectedPlugin = 0
+		// 滤掉本次运行里"已经被删掉"的插件：删除是重启生效的，目录此刻可能
+		// 还在（deferred），不滤掉的话下一轮扫描又会把它的页面加回来。
+		if len(a.st.droppedPlugins) > 0 {
+			kept := a.st.plugins[:0]
+			for _, p := range a.st.plugins {
+				if a.st.droppedPlugins[p.ID] || a.st.droppedPlugins[p.Dir] {
+					continue
+				}
+				kept = append(kept, p)
+			}
+			a.st.plugins = kept
 		}
-		if !out.quiet {
-			a.st.status = fmt.Sprintf("已读取 %d 个插件，%d 个在运行", len(out.plugins), countRunning(out.plugins))
+		// 带页面的那组服务变过（插件装上了 / 被删掉了 / 崩了）才重新问一次清单。
+		//
+		// 判据必须是"变过"而不是"为空"：插件是逐个激活的，界面可能比它先起来，
+		// 所以要补问；可删掉一个插件之后清单非空，按"为空才问"就再也不问了 ——
+		// 那一页会永远挂在标签栏上，点进去只剩一句"插件不在了"。
+		//
+		// 比的是"有哪些服务声称自己带页面"，不是"问回来的页码"：后者对
+		// 一个报了服务却一页都不给的插件会永远不相等，于是每次扫描都去问一轮。
+		if svcs := pageServices(a.st.plugins); !sameStrings(svcs, a.st.pagesSeen) {
+			a.st.pagesSeen = svcs
+			a.loadPages()
+		}
+		// 浮窗清单也跟着插件清单对齐：谁声明了 ui.widget.* 就给谁挂浮窗
+		a.syncWidgets()
+
+	case "widgets":
+		if out.err != nil {
+			a.st.status = "读取浮窗清单失败：" + out.err.Error()
+			a.st.statusOK = false
+			return
+		}
+		a.applyWidgets(out.widgetSvc, out.widgetInfos)
+
+	case "widgetrender":
+		a.applyWidgetRender(out.widgetIdx, out.widgetOut, out.err)
+
+	case "pages":
+		a.st.pagesBusy = false
+		if out.err != nil {
+			// 没问成就不算"问过"：把判据清掉，下一轮扫描还会再试。
+			// 不然一次抖动就会让标签栏空着，直到哪天有个插件的服务名变了为止。
+			a.st.pagesSeen = nil
+			a.st.status = "读取插件页面失败：" + out.err.Error()
+			a.st.statusOK = false
+			return
+		}
+		a.st.pages = out.pages
+		a.st.pageTitle = ""
+		// 清单变了，手上那些帧可能属于已经不在的页面：只留还活着的，其余连
+		// **在途的**一起丢掉 —— 一份"删除之前"的帧回来又被当成新的存进去，
+		// 下一帧还会照它画，那就成了"删了还在"。
+		alive := make(map[string]bool, len(out.pages))
+		for _, p := range out.pages {
+			alive[p.ref()] = true
+		}
+		for k := range a.st.pageCache {
+			if !pageKeyAlive(k, alive) {
+				delete(a.st.pageCache, k)
+			}
+		}
+		for k := range a.st.pagePending {
+			if !pageKeyAlive(k, alive) {
+				delete(a.st.pagePending, k)
+			}
+		}
+		if a.st.tab == tabPanel {
+			if _, ok := a.st.activePage(); !ok {
+				// 正看着的那一页没了（插件被删或被禁用）：退回聊天。
+				// 留在一块空白上，比什么都不做更让人摸不着头脑。
+				name := pageRefName(a.st)
+				a.setTab(tabChat)
+				a.st.notice = "「" + name + "」这一页的插件不在了，已回到聊天"
+				a.st.noticeOK = false
+			}
+		}
+
+	case "page":
+		delete(a.st.pagePending, out.pageKey)
+		if a.st.pageCache == nil {
+			a.st.pageCache = map[string]*pageRender{}
+		}
+		if out.err != nil {
+			// 失败也存成一帧：每帧都重试等于把插件按在地上反复打
+			a.st.pageCache[out.pageKey] = pageErrorView(out.pageReq, out.err)
+			return
+		}
+		v := &pageRender{
+			svc: out.pageReq.svc, id: out.pageReq.id,
+			w: out.pageReq.w, h: out.pageReq.h, scroll: out.pageReq.scroll,
+			out: out.pageOut,
+		}
+		a.st.pageCache[out.pageKey] = v
+
+		// 滚动位置以插件夹过的那个为准：不认它的话，宿主会一直按一个越界的
+		// 位置去要帧 —— 每次都白跑一趟，而且永远画不出新内容。
+		if a.st.tab == tabPanel && a.st.pageSvc == v.svc && a.st.pageID == v.id {
+			a.st.pageScroll = v.out.Scroll
+			a.st.pageMax = v.out.MaxScroll
+		}
+
+	case "pageact":
+		if out.err != nil {
+			a.st.status = "页面操作失败：" + out.err.Error()
+			a.st.statusOK = false
+			return
+		}
+		if out.pageNote != "" {
+			a.st.status = out.pageNote
 			a.st.statusOK = true
 		}
-
-	case "llm":
-		if out.err != nil {
-			a.st.status = "读取 LLM 配置失败：" + out.err.Error()
-			a.st.statusOK = false
-			return
-		}
-		a.applyLLM(*out.cfg, !out.quiet)
-
-	case "models":
-		a.st.modelsBusy = false
-		a.st.status = out.note
-		a.st.statusOK = out.err == nil
-		if out.err != nil {
-			return
-		}
-		a.st.modelList = out.models
-		// 只有一个模型就直接选上，省用户一次点击
-		if len(out.models) == 1 {
-			if f := a.st.field("model"); f != nil {
-				f.value = out.models[0]
-			}
-		}
-
-	case "saved":
-		if out.err != nil {
-			// 把用户输入的密钥还回输入框，只把失败原因说清楚
-			if out.apiKey != "" {
-				if f := a.st.field("apiKey"); f != nil {
-					f.value = out.apiKey
-					f.dirty = true
-				}
-			}
-			a.st.status = out.note
-			a.st.statusOK = false
-			return
-		}
-		// 成功：清掉明文（密钥不该停在屏幕上），并把「已配置 ****」的提示挂上
-		for i := range a.st.fields {
-			a.st.fields[i].dirty = false
-		}
-		if f := a.st.field("apiKey"); f != nil {
-			f.value = ""
-			if out.apiKey != "" {
-				f.hint = "已配置 " + maskForDisplay(out.apiKey)
-			}
-		}
-		// 焦点从密钥框移开：否则用户盯着一个空框，会以为刚才白填了
-		if a.st.focus == "apiKey" {
-			a.st.focus = ""
-		}
-		a.st.status = out.note
-		a.st.statusOK = true
-
-	case "ws":
-		a.st.wsBusy = false
-		a.st.wsSetBusy = false
-		if out.err != nil {
-			a.st.status = firstNonEmpty(out.note, out.err.Error())
-			a.st.statusOK = false
-			return
-		}
-		if out.ws != nil {
-			a.st.wsPath = out.ws.Path
-			a.st.wsParent = out.ws.Parent
-			a.st.wsEntries = out.ws.Entries
-			a.st.wsRoot = out.ws.Root
-			a.st.wsSel = 0
-			a.st.wsScroll = 0
-			// 浏览到的目录同步回输入框：这样"点着挑"和"手填"看到的永远是同一个路径
-			if f := a.st.field("wsPath"); f != nil {
-				f.value = out.ws.Path
-				f.dirty = false
-			}
-		}
-		a.st.status = firstNonEmpty(out.note, "目录已读取")
-		a.st.statusOK = true
 
 	case "attach":
 		a.st.attachBusy = false
@@ -662,68 +649,6 @@ func (a *app) applyConv(s convSnapshot) {
 	}
 }
 
-// applyLLM 把配置刷进表单。announce=false 时不动底部状态栏，
-// 用于保存后的回读 —— 那时用户更需要看到「已写入」而不是「当前 provider」。
-func (a *app) applyLLM(cfg llmConfig, announce bool) {
-	a.st.provider = cfg.Provider
-
-	if announce {
-		shown := cfg.Provider
-		if shown == "" {
-			shown = "未配置"
-		}
-		a.st.status = "当前 provider：" + shown
-		a.st.statusOK = true
-	}
-
-	// 必须按索引取指针：range 拿到的是元素副本，改副本不会写回切片
-	for i := range a.st.fields {
-		f := &a.st.fields[i]
-		if f.dirty {
-			continue // 用户改过的字段不许被后台刷新覆盖
-		}
-		switch f.key {
-		case "baseUrl":
-			f.value = cfg.BaseURL
-			f.hint = ""
-		case "model":
-			f.value = cfg.Model
-			f.hint = ""
-		case "apiKey":
-			// 明文拿不回来，只能显示打码值做提示；输入框留空表示"不改动"
-			f.value = ""
-			if cfg.APIKey == "" {
-				f.hint = "未配置，点一下就能粘贴"
-			} else {
-				// 括号里的说明由区块标题统一交代，这里只留最重要的"已配置 + 打码值"
-				f.hint = "已配置 " + cfg.APIKey
-			}
-		case "visionModel":
-			// 与密钥一致：留空 = 不改动，所以当前值只放进提示里，不占输入框。
-			// （若把值填进输入框，"留空=不改动"就永远不成立了）
-			f.value = ""
-			if cfg.VisionModel == "" {
-				f.hint = "留空 = 跟主模型一样"
-			} else {
-				f.hint = "当前 " + cfg.VisionModel
-			}
-		}
-	}
-
-	// 按配置里的地址把界面上的服务选中状态还原出来
-	a.st.presetKey = presetByBaseURL(cfg.BaseURL)
-	a.st.modelList = nil
-	if p, ok := presetByKey(a.st.presetKey); ok {
-		a.st.modelList = append([]string{}, p.Models...)
-	}
-
-	// 当前模型如果不在列表里（比如自己填的），补到最前面，保证选中的那个看得见
-	if m := a.fieldValue("model"); m != "" && !contains(a.st.modelList, m) {
-		a.st.modelList = append([]string{m}, a.st.modelList...)
-	}
-	a.st.modelsNote = ""
-}
-
 // ---------------------------------------------------------------------------
 // 输入分发
 // ---------------------------------------------------------------------------
@@ -740,20 +665,43 @@ func (a *app) handle(ev event) (quit bool) {
 		switch {
 		case ev.mouse.Press:
 			// 浮窗盖在最上面：按在它身上就是"抓住它"，不是点它盖住的那个按钮
-			if a.grabFloat(ev.mouse.X, ev.mouse.Y) {
+			if a.grabWidget(ev.mouse.X, ev.mouse.Y) {
 				return false
 			}
-			a.click(ev.mouse.X, ev.mouse.Y)
+			a.pressStart(ev.mouse.X, ev.mouse.Y)
 		case ev.mouse.Drag:
-			a.dragFloat(ev.mouse.X, ev.mouse.Y)
+			if a.st.drag != nil {
+				a.dragSelect(ev.mouse.X, ev.mouse.Y)
+				return false
+			}
+			a.dragWidget(ev.mouse.X, ev.mouse.Y)
 		case ev.mouse.Rel:
-			a.dropFloat()
+			a.release(ev.mouse.X, ev.mouse.Y)
 		}
+		return false
+	}
+
+	// 插件自带的页面自己收键盘：它说了要（WantKeys）就给它。Tab 永远留给宿主
+	// 切页 —— 那是用户仅有的退路，交给插件的话，一个写坏的页面就能把人困住。
+	// Ctrl+C 走 pageKey 自己判断：页面声明了"要复制"（WantCopy）就转给它复制，
+	// 否则照旧留作宿主的退出（见 pageKey）。
+	if ev.key != keyTab && a.pageKey(ev) {
 		return false
 	}
 
 	switch ev.key {
 	case keyCtrlC:
+		// Ctrl+C 专职复制：有选中就复制；没选中只提示，绝不退出。
+		// 退出是 Ctrl+Q —— 两个动作挤在一个键上，拖选想复制却因为没选中
+		// 而把程序关了，是这里最吓人的误触。
+		if a.hasSel() {
+			a.copySelection()
+		} else {
+			a.tell("没有选中文字：拖动选中后再 Ctrl+C 复制（退出用 Ctrl+Q）", false)
+		}
+		return false
+	case keyCtrlQ:
+		// 退出：明确的退出键，不和复制抢 Ctrl+C
 		return true
 	case keyCtrlL:
 		// Ctrl+L 原本是「清屏」。现在对话存在会话树里，清屏等于把用户自己写的东西
@@ -774,20 +722,24 @@ func (a *app) handle(ev event) (quit bool) {
 	case keyRight:
 		a.moveCursor(1)
 	case keyHome:
-		a.st.cursor = 0
+		a.moveInputEdge(false)
 	case keyEnd:
-		a.st.cursor = len(a.st.input)
+		a.moveInputEdge(true)
 	case keyAltLeft:
-		a.nudgeFloat(-2, 0)
+		a.nudgeWidget(-2, 0)
 	case keyAltRight:
-		a.nudgeFloat(2, 0)
+		a.nudgeWidget(2, 0)
 	case keyAltUp:
-		a.nudgeFloat(0, -1)
+		a.nudgeWidget(0, -1)
 	case keyAltDown:
-		a.nudgeFloat(0, 1)
+		a.nudgeWidget(0, 1)
 	case keyUp:
 		if a.st.attachOpen {
 			a.moveAttachSel(-1)
+			return false
+		}
+		// 输入框有多行时 ↑↓ 归光标：否则写了三行就再也回不到上一行去改
+		if a.moveInputLine(-1) {
 			return false
 		}
 		a.moveSelection(-1)
@@ -796,14 +748,33 @@ func (a *app) handle(ev event) (quit bool) {
 			a.moveAttachSel(1)
 			return false
 		}
+		if a.moveInputLine(1) {
+			return false
+		}
 		a.moveSelection(1)
 	case keyEnter:
 		if a.st.attachOpen {
 			a.addSelectedAttachment()
 			return false
 		}
+		// 聊天页：回车是**换行**，不是发送。
+		// 发送只走「发送」按钮，或 Ctrl+Enter —— 写长消息时敲个回车就发出去，
+		// 是这里最烦人的一件事（顺手补一句就得重打一遍）。
+		if a.st.tab == tabChat && !a.st.shareOpen {
+			a.insertNewline()
+			return false
+		}
 		a.enter()
+	case keyCtrlEnter:
+		// 键盘用户的送出口：手不离开键盘也能发
+		if a.st.tab == tabChat && !a.st.shareOpen && !a.st.attachOpen {
+			a.enter()
+		}
 	case keyEsc:
+		// 有选中时 Esc 先撤选择 —— "反悔键"最浅的那一层
+		if a.clearSelIfAny() {
+			return false
+		}
 		// Esc 是「反悔键」，按最外层的临时状态往里收
 		if a.st.attachOpen {
 			a.closeAttach()
@@ -825,13 +796,6 @@ func (a *app) handle(ev event) (quit bool) {
 		}
 		if a.st.editing != "" {
 			a.cancelEdit()
-			return false
-		}
-		// 删除插件确认进行中：Esc 先撤掉确认，这也是最符合直觉的"反悔"键
-		if a.st.confirmDelete {
-			a.st.confirmDelete = false
-			a.st.status = "已取消删除"
-			a.st.statusOK = true
 			return false
 		}
 		a.st.input = nil
@@ -872,15 +836,45 @@ func (a *app) restart() {
 	}()
 }
 
+// switchTab 在"内置页 + 插件页"里前后切一页。
+//
+// 走的是 allTabsOf 而不是固定的 allTabs：装了带界面的插件，Tab 就得能走到它。
 func (a *app) switchTab(delta int) {
+	list := allTabsOf(a.st)
+	if len(list) == 0 {
+		return
+	}
 	idx := 0
-	for i, t := range allTabs {
-		if t == a.st.tab {
+	for i, t := range list {
+		if t.matches(a.st) {
 			idx = i
 		}
 	}
-	idx = (idx + delta + len(allTabs)) % len(allTabs)
-	a.setTab(allTabs[idx])
+	a.gotoTab(list[(idx+delta+len(list))%len(list)])
+}
+
+// gotoTab 切到某个标签上。
+func (a *app) gotoTab(t tabTarget) {
+	if t.kind == tabPanel {
+		a.openPage(t.svc, t.panel)
+		return
+	}
+	a.setTab(t.kind)
+}
+
+// goTab 处理一次标签点击。arg 要么是内置页的 key，要么是 "page:<服务>/<页面id>"。
+func (a *app) goTab(arg string) {
+	if ref, ok := strings.CutPrefix(arg, "page:"); ok {
+		if svc, id, ok := strings.Cut(ref, "/"); ok {
+			a.openPage(svc, id)
+		}
+		return
+	}
+	for _, t := range allTabs {
+		if t.key() == arg {
+			a.setTab(t)
+		}
+	}
 }
 
 // setTab 切页并重置焦点。
@@ -888,84 +882,23 @@ func (a *app) switchTab(delta int) {
 // 设置页会把底部提示改成配置状态：否则上一个页面的操作提示会一直挂在下面，
 // 看起来像刚刚在这里发生过。
 func (a *app) setTab(t tabKind) {
+	// 切页就撤掉一切选择：选中是"正在改这个输入框"的临时状态，
+	// 跟焦点一样不该跨页留着。
+	a.clearSelAll()
+	a.st.drag = nil
 	a.st.tab = t
 	if t == tabChat {
 		a.st.focus = "chat"
 		return
 	}
 	a.st.focus = ""
-	if t == tabFiles {
-		a.st.status = "当前工作区：" + firstNonEmpty(a.st.wsRoot, "未指定")
-		a.st.statusOK = a.st.wsRoot != ""
-		// 一进来就落在路径框上：选也好、填也好，都是从这一行开始
-		if a.st.field("wsPath") != nil {
-			a.st.focus = "wsPath"
-		}
-		// 还没读到东西就补一次：启动时那次可能撞上插件尚未就绪
-		if len(a.st.wsEntries) == 0 && !a.st.wsBusy {
-			a.browseTo(a.st.wsPath)
-		}
-		return
-	}
-	if t == tabSettings {
-		a.st.status = "当前 provider：" + firstNonEmpty(a.st.provider, "未配置")
-		a.st.statusOK = true
-		// 切到设置页就先把 API Key 输入框聚焦：绝大多数人进来就是来粘密钥的，
-		// 不该还要先点一下输入框才能打字。
-		if a.st.field("apiKey") != nil {
-			a.st.focus = "apiKey"
-		}
-		// agent 可能比界面晚就绪，启动那次没读到就在这里补一次
-		if !a.st.budgetLoaded && !a.st.budgetBusy {
-			a.reloadBudget()
-		}
-	}
 }
 
 // onTab 处理 Tab 键。
 //
-// 设置页正聚焦某个控件时，Tab 在控件之间移动，而不是切页 ——
-// 这样即使粘贴内容里混进制表符，最多只是换个输入框，不会把整个页面弹走。
+// 内置页不再有表单了（设置页搬走了），所以 Tab 就是切页。
 func (a *app) onTab() {
-	if a.st.tab == tabSettings && a.st.focus != "" && a.st.focus != "none" {
-		a.cycleFocus(1)
-		return
-	}
 	a.switchTab(1)
-}
-
-// focusOrder 是设置页的焦点顺序（字段 + 按钮）。
-func focusOrder(t tabKind) []string {
-	if t != tabSettings {
-		return nil
-	}
-	return []string{
-		"baseUrl", "model", "apiKey", "btn:getmodels", "btn:save", "btn:test",
-		"agentSteps", "budget:limited", "budget:unlimited", "btn:budgetsave",
-	}
-}
-
-// cycleFocus 在当前页面的控件之间移动焦点。
-func (a *app) cycleFocus(delta int) {
-	keys := focusOrder(a.st.tab)
-	if len(keys) == 0 {
-		return
-	}
-	idx := -1
-	for i, k := range keys {
-		if k == a.st.focus {
-			idx = i
-		}
-	}
-	if idx < 0 {
-		if delta > 0 {
-			a.st.focus = keys[0]
-		} else {
-			a.st.focus = keys[len(keys)-1]
-		}
-		return
-	}
-	a.st.focus = keys[(idx+delta+len(keys))%len(keys)]
 }
 
 // click 处理一次鼠标点击：按坐标反查渲染时登记的动作。
@@ -984,35 +917,16 @@ func (a *app) click(x, y int) {
 
 	switch kind {
 	case "tab":
-		for _, t := range allTabs {
-			if t.key() == arg {
-				a.setTab(t)
-			}
+		a.goTab(arg)
+
+	case "panel":
+		// 插件页面里的点击：arg 是这一帧热区的下标（见 pageRows）
+		if i := atoiSafe(arg); i >= 0 && i < len(a.st.pageHits) {
+			a.pageHit(a.st.pageHits[i])
 		}
 
 	case "svc":
 		a.focusService(arg)
-
-	case "plugin":
-		// arg 是行号，不是插件 ID：目录里允许存在两份 ID 相同的插件
-		// （x.plugin 与 x.plugin.disabled 就是），按 ID 找的话后一份永远选不中。
-		if i := atoiSafe(arg); i >= 0 {
-			a.selectPlugin(i)
-		}
-
-	case "wsdir":
-		// 点目录进去：拼在浏览路径后面即可，分隔符的差异由插件侧解析
-		a.browseTo(strings.TrimRight(a.st.wsPath, `/\`) + "/" + arg)
-
-	case "wsfile":
-		for i, e := range a.st.wsEntries {
-			if e.Name == arg {
-				a.st.wsSel = i
-				a.st.status = "已选中文件 " + e.Name + "（" + humanSize(e.Size) + "）"
-				a.st.statusOK = true
-				break
-			}
-		}
 
 	case "atchdir":
 		a.browseTo2(arg, true)
@@ -1028,31 +942,15 @@ func (a *app) click(x, y int) {
 	case "openimg":
 		a.openImage(arg)
 
-	case "preset":
-		a.applyPreset(arg)
-
-	case "model":
-		if f := a.st.field("model"); f != nil {
-			f.value = arg
-		}
-		a.st.status = "已选模型：" + arg + "，点「保存并生效」写入"
-		a.st.statusOK = true
-
-	case "budget":
-		a.pickBudgetMode(arg == "unlimited")
-
 	case "core":
 		// 标签栏上的「重启」：请核心重新加载插件（插件的启停 / 删除都是重启后生效）
 		if arg == "restart" {
 			a.restart()
 		}
 
-	case "focus":
-		if arg == "none" {
-			a.st.focus = ""
-		} else {
-			a.st.focus = arg
-		}
+	case "caret":
+		// 点在输入框的文字上：把光标放到点击的那一列
+		a.setCaret(arg, y)
 
 	case "msg":
 		id, verb := splitLast(arg)
@@ -1070,6 +968,240 @@ func (a *app) click(x, y int) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 输入框的鼠标操作：点击定位光标、拖动选中
+// ---------------------------------------------------------------------------
+
+// setCaret 处理一次"点在输入框文字上"：把光标放到点击的那一列，并把焦点带过去。
+// arg 是 "target:col"（target 是 chat 或字段 key，col 是内容区内的列号）。
+func (a *app) setCaret(arg string, y int) {
+	target, colS := splitLast(arg)
+	col := atoiSafe(colS)
+	if col < 0 {
+		col = 0
+	}
+
+	if target == "chat" {
+		if a.st.tab != tabChat || a.st.shareOpen || a.st.attachOpen {
+			return
+		}
+		a.st.focus = "chat"
+		box := buildInputBox(a.st, a.st.w, a.st.h)
+		// 行号由 y 补上：输入区贴屏幕底部，第几行 = y 到输入区顶部的距离
+		k := y - (a.st.h - box.rows)
+		k = clampInt(k, 0, box.rows-1)
+		idx := box.view.from + k
+		col = clampInt(col, 0, box.textW)
+		if idx < 0 || idx >= len(box.view.lines) {
+			// 点在内容之外的空白行：光标落到底
+			a.st.cursor = len(a.st.input)
+			return
+		}
+		a.st.cursor = box.view.indexAt(idx, col)
+	}
+}
+
+// pressStart 处理一次鼠标按下：按普通点击处理，若按在输入框文字上则同时记下拖动起点。
+func (a *app) pressStart(x, y int) {
+	a.st.drag = nil
+	action := a.canv.hit(x, y)
+	a.click(x, y)
+
+	kind, arg := action, ""
+	if i := strings.IndexByte(action, ':'); i >= 0 {
+		kind, arg = action[:i], action[i+1:]
+	}
+
+	// 插件页面：点在某个输入字段上，也要能拖选。
+	// 点击已经经 click -> pageHit 把 caret 转给了插件（插件据此落锚点），
+	// 这里只记下"正在哪个字段上拖"，拖动时再把落点热区的列号转过去。
+	if kind == "panel" {
+		if i := atoiSafe(arg); i >= 0 && i < len(a.st.pageHits) {
+			ref := a.st.pageHits[i]
+			if ref.hit.Action == "caret" {
+				field, _, _ := strings.Cut(ref.hit.Arg, ":")
+				a.st.drag = &dragSel{target: "panel", svc: ref.svc, id: ref.id, field: field}
+			}
+		}
+		return
+	}
+	if kind != "caret" {
+		return
+	}
+	target, colS := splitLast(arg)
+	col := atoiSafe(colS)
+	fx := x - col
+	if target == "chat" {
+		fx = 1 + buildInputBox(a.st, a.st.w, a.st.h).promptW
+	}
+	anchor := -1
+	if target == "chat" {
+		anchor = a.st.cursor
+	}
+	if anchor < 0 {
+		return
+	}
+	a.st.drag = &dragSel{target: target, anchor: anchor, fx: fx}
+	a.applyDragSel(target, anchor, anchor)
+}
+
+// dragSelect 处理一次按住左键的移动：从起点往当前位置拖出一段选择。
+func (a *app) dragSelect(x, y int) {
+	d := a.st.drag
+	if d == nil {
+		return
+	}
+	if d.target == "panel" {
+		a.dragPanelSel(d, x, y)
+		return
+	}
+	idx := a.caretIndex(d.target, d.fx, x, y)
+	if idx < 0 {
+		return
+	}
+	if d.target == "chat" {
+		a.st.cursor = idx
+	}
+	a.applyDragSel(d.target, d.anchor, idx)
+}
+
+// dragPanelSel 把一次插件页面内的拖动转成 sel 动作发给插件。
+//
+// 宿主不算列号：插件为字段的每一列都登记了 caret 热区，拖到哪个热区，
+// 就把哪个热区自带的 "字段:列" 转过去。拖出字段、拖到别的字段，都不算。
+func (a *app) dragPanelSel(d *dragSel, x, y int) {
+	action := a.canv.hit(x, y)
+	kind, arg := action, ""
+	if i := strings.IndexByte(action, ':'); i >= 0 {
+		kind, arg = action[:i], action[i+1:]
+	}
+	if kind != "panel" {
+		return
+	}
+	i := atoiSafe(arg)
+	if i < 0 || i >= len(a.st.pageHits) {
+		return
+	}
+	ref := a.st.pageHits[i]
+	if ref.hit.Action != "caret" {
+		return
+	}
+	field, _, _ := strings.Cut(ref.hit.Arg, ":")
+	if field != d.field {
+		return // 拖到别的字段上了
+	}
+	go func() {
+		note, err := a.plug.pageAction(ref.svc, ref.id, "sel", ref.hit.Arg)
+		a.results <- outcome{kind: "pageact", note: note, err: err}
+	}()
+}
+
+// release 处理一次松手：结束拖动（或浮窗拖动），给选中的结果一句反馈。
+func (a *app) release(x, y int) {
+	if a.st.drag == nil {
+		a.dropWidget()
+		return
+	}
+	d := a.st.drag
+	a.st.drag = nil
+
+	if d.target == "panel" {
+		// 选择落在插件侧，字符数也在插件侧：收尾不用发东西，插件重绘时
+		// 会自己把选中段画出来、并把"Ctrl+C 复制"写进它的说明行。
+		return
+	}
+
+	n := 0
+	if d.target == "chat" && a.st.selOn {
+		n = a.st.selB - a.st.selA
+	}
+	if n > 0 {
+		a.tell(fmt.Sprintf("已选中 %d 个字符：Ctrl+C 复制，Esc 取消", n), true)
+	}
+}
+
+// caretIndex 把鼠标坐标换算成输入框内的 rune 下标；不在输入区返回 -1。
+func (a *app) caretIndex(target string, fx, x, y int) int {
+	col := x - fx
+	if target == "chat" {
+		if a.st.tab != tabChat || a.st.shareOpen || a.st.attachOpen {
+			return -1
+		}
+		box := buildInputBox(a.st, a.st.w, a.st.h)
+		k := y - (a.st.h - box.rows)
+		k = clampInt(k, 0, box.rows-1)
+		idx := box.view.from + k
+		if idx < 0 || idx >= len(box.view.lines) {
+			return len(a.st.input)
+		}
+		return box.view.indexAt(idx, clampInt(col, 0, box.textW))
+	}
+	return -1
+}
+
+// applyDragSel 把选区更新为 [lo, hi)。
+func (a *app) applyDragSel(target string, a1, a2 int) {
+	lo, hi := a1, a2
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if target == "chat" {
+		a.st.selOn = lo != hi
+		a.st.selA, a.st.selB = lo, hi
+	}
+}
+
+// hasSel 问"现在聊天输入框里有没有一段选中文字"。
+func (a *app) hasSel() bool {
+	return a.st.selOn
+}
+
+// selText 返回聊天输入框里当前选中段的文字。
+func (a *app) selText() string {
+	if a.st.selOn && a.st.selA < a.st.selB && a.st.selB <= len(a.st.input) {
+		return string(a.st.input[a.st.selA:a.st.selB])
+	}
+	return ""
+}
+
+// clearSelAll 清掉输入框上的选择（切页、开始打字、复制完都走这里）。
+func (a *app) clearSelAll() {
+	a.st.selOn = false
+}
+
+// clearSelIfAny 取消当前选择；没有选择返回 false（调用方照常处理 Esc）。
+func (a *app) clearSelIfAny() bool {
+	if !a.hasSel() {
+		return false
+	}
+	a.clearSelAll()
+	a.tell("已取消选择", true)
+	return true
+}
+
+// copySelection 把选中的文字写进系统剪贴板（OSC 52，见 util.go）。
+func (a *app) copySelection() {
+	text := a.selText()
+	a.clearSelAll()
+	if text == "" {
+		return
+	}
+	if a.copyToClipboard(text) {
+		a.tell(fmt.Sprintf("已复制 %d 个字符", len([]rune(text))), true)
+		return
+	}
+	a.tell("复制失败：内容过长或终端不支持剪贴板", false)
+}
+
+// tell 在页面底部给一句反馈：聊天页用 notice（输入行上方那行），其它页用状态栏。
+func (a *app) tell(msg string, ok bool) {
+	if a.st.tab == tabChat {
+		a.st.notice, a.st.noticeOK = msg, ok
+		return
+	}
+	a.st.status, a.st.statusOK = msg, ok
+}
+
 // splitLast 从右边切一刀。
 //
 // 动作写成 "msg:n3:edit" 这种两段带参的形式：click 已经按第一个冒号切过一次，
@@ -1081,38 +1213,16 @@ func splitLast(s string) (head, tail string) {
 	return s, ""
 }
 
-// selectPlugin 选中第 i 个插件。
+// focusService 点侧栏里的某个服务：说清楚它此刻是谁在提供。
 //
-// 换选中时必须撤掉上一次的删除确认：否则在 A 上点了"删除插件"，
-// 切到 B 再随手一点，删掉的就是 B 了。
-func (a *app) selectPlugin(i int) {
-	if i < 0 || i >= len(a.st.plugins) {
-		return
-	}
-	a.st.selectedPlugin = i
-	a.st.confirmDelete = false
-	p := a.st.plugins[i]
-	a.st.tab = tabPlugins
-	a.st.status = "已选中 " + p.ID + " · " + pluginStateText(p)
-	a.st.statusOK = p.running()
-}
-
-// selected 返回当前选中的插件。
-func (a *app) selected() (pluginInfo, bool) {
-	if a.st.selectedPlugin < 0 || a.st.selectedPlugin >= len(a.st.plugins) {
-		return pluginInfo{}, false
-	}
-	return a.st.plugins[a.st.selectedPlugin], true
-}
-
-// focusService 点侧栏里的某个服务：跳到插件页并选中它的提供者。
+// 以前它会跳到「插件」页并选中提供者。那一页现在由插件管理器自带，
+// 而"跳进去并选中某个插件"需要面板协议为某一页开特例（多带一个选中参数）——
+// 不值当：这里退回它本来就能说清的那件事，要管理插件就去那个标签页。
 func (a *app) focusService(name string) {
-	for i, p := range a.st.plugins {
+	for _, p := range a.st.plugins {
 		if contains(p.Provides, name) {
-			a.st.selectedPlugin = i
-			a.st.tab = tabPlugins
 			if p.running() {
-				a.st.status = "服务 " + name + " 由 " + p.ID + " 提供"
+				a.st.status = "服务 " + name + " 由 " + p.ID + " 提供（在插件页里能看到它）"
 				a.st.statusOK = true
 			} else {
 				a.st.status = "服务 " + name + " 当前不可用（声明于 " + p.ID + "）"
@@ -1646,93 +1756,9 @@ func (a *app) press(btn string) {
 	case "attachclear":
 		a.clearAttachments()
 
-	case "rescan":
-		// 手动那一次要出声：用户点了按钮，就得看到「正在重新扫描…」
-		a.rescan(false)
-
-	case "getmodels":
-		// 直接把表单里的值传下去：先试能不能连上，再去保存，顺序更顺手
-		provider := a.st.provider
-		baseURL := a.fieldValue("baseUrl")
-		apiKey := a.fieldValue("apiKey")
-		a.st.modelsBusy = true
-		a.st.status = "正在向服务端要模型列表…"
-		a.st.statusOK = true
-		go func() {
-			models, note, err := a.plug.listModels(provider, baseURL, apiKey)
-			a.results <- outcome{kind: "models", models: models, note: note, err: err}
-		}()
-
-	case "save":
-		provider := a.st.provider
-		baseURL := a.fieldValue("baseUrl")
-		model := a.fieldValue("model")
-		apiKey := a.fieldValue("apiKey")
-		visionModel := a.fieldValue("visionModel")
-		if provider == "" && baseURL == "" && model == "" && apiKey == "" && visionModel == "" {
-			a.st.status = "没有可保存的改动"
-			a.st.statusOK = false
-			return
-		}
-		a.st.status = "正在保存…"
-		a.st.statusOK = true
-		// 关键：这里**先不动输入框**。保存成功才清明文并给出打码确认；
-		// 失败就把密钥原样留着让用户重试 —— 否则一次网络抖动就要重新粘一遍。
-		go func() {
-			note, err := a.plug.saveLLM(provider, baseURL, model, apiKey, visionModel)
-			a.results <- outcome{kind: "saved", note: note, err: err, apiKey: apiKey}
-			if err == nil {
-				// 保存成功后回读一次，把服务端的打码值刷到界面上（quiet：别顶掉确认信息）
-				a.reloadLLM(true)
-			}
-		}()
-
-	case "test":
-		a.st.status = "正在测试连接…"
-		a.st.statusOK = true
-		go func() {
-			note, err := a.plug.testLLM()
-			a.results <- outcome{kind: "status", note: note, err: err}
-		}()
-
-	case "toggle":
-		a.toggleSelected()
-
-	case "del":
-		p, ok := a.selected()
-		if !ok {
-			return
-		}
-		// 删除不可逆，先要一次确认
-		a.st.confirmDelete = true
-		a.st.status = "删除 " + p.ID + " 不可撤销（连配置与日志一起），确认请点「确认删除」"
-		a.st.statusOK = false
-
-	case "delconfirm":
-		a.st.confirmDelete = false
-		a.deleteSelected()
-
-	case "delcancel":
-		a.st.confirmDelete = false
-		a.st.status = "已取消删除"
-		a.st.statusOK = true
-
-	case "wsset":
-		a.setWorkspaceRoot()
-
-	case "wsrefresh":
-		a.browseTo(a.st.wsPath)
-
-	case "wsup":
-		if a.st.wsParent != "" {
-			a.browseTo(a.st.wsParent)
-		} else {
-			a.st.status = "已经在最顶层了"
-			a.st.statusOK = true
-		}
-
-	case "budgetsave":
-		a.saveBudget()
+	case "send":
+		// 唯一的发送入口：点「发送」按钮走这里（回车现在只换行）
+		a.enter()
 
 	// 会话
 	case "sessnew":
@@ -1776,233 +1802,100 @@ func (a *app) sessionName() string {
 	return a.st.sessID
 }
 
-// pickBudgetMode 选中「限制步数 / 不限制」。选完还要点「应用预算」才写下去 ——
-// 这和这一页其他地方的手感一致：先摆好，再点保存。
-func (a *app) pickBudgetMode(unlimited bool) {
-	a.st.budgetUnlimited = unlimited
-	if unlimited {
-		a.st.budgetNote = "已选「不限制」，点「应用预算」写入"
-		return
-	}
-	a.st.budgetNote = "已选「限制步数」，点「应用预算」写入"
-}
-
-// saveBudget 把预算写给 agent。
-func (a *app) saveBudget() {
-	if a.st.budgetBusy {
-		return
-	}
-	unlimited := a.st.budgetUnlimited
-	steps := 0
-	if !unlimited {
-		n, err := strconv.Atoi(a.fieldValue("agentSteps"))
-		if err != nil || n <= 0 {
-			a.st.status = "工具上限要填一个正整数；不想限制就选「不限制」"
-			a.st.statusOK = false
-			return
-		}
-		steps = n
-	}
-	a.st.budgetBusy = true
-	a.st.status = "正在应用预算…"
-	a.st.statusOK = true
-	go func() {
-		note, err := a.plug.saveAgentBudget(steps, unlimited)
-		a.results <- outcome{kind: "status", note: note, err: err}
-		a.post(func() { a.reloadBudget() })
-	}()
-}
-
-// browseTo 在文件页里切换当前浏览的目录。
-//
-// 界面可能比 workspace 插件先起来 —— 插件是逐个启动的，实测两者能差 9 毫秒。
-// 那一次调用会撞上"服务未找到"，所以失败要退避重试几次，而不是把空列表摆在用户面前。
-func (a *app) browseTo(path string) {
-	if a.st.wsBusy {
-		// 上一次还没回来。这里要是悄悄把点击吞掉，用户看到的就是"点了没反应" ——
-		// 手快连点两下目录时特别明显。说一句，让他知道是等一下而不是点错了。
-		a.st.status = "正在读取目录，稍等一下再点"
-		a.st.statusOK = true
-		return
-	}
-	a.st.wsBusy = true
-	a.st.status = "正在读取目录…"
-	a.st.statusOK = true
-	go func() {
-		var ls wsListing
-		var err error
-		for attempt := 0; attempt < 4; attempt++ {
-			if ls, err = a.plug.wsBrowse(path); err == nil {
-				break
-			}
-			time.Sleep(250 * time.Millisecond)
-		}
-		a.results <- outcome{kind: "ws", ws: &ls, err: err, note: ls.Note}
-	}()
-}
-
-// setWorkspaceRoot 把工作区设成输入框里的路径（留空则用当前浏览到的目录）。
-//
-// 这就是"可选可填"的合流点：点着挑也好、粘路径也好，最后都走这里。
-func (a *app) setWorkspaceRoot() {
-	// 只看"设置"自己是否在途，不看读目录 —— 进页面时的懒加载正好在读，
-	// 用户这时候按回车必须照样生效，否则就是"回车没反应"。
-	if a.st.wsSetBusy {
-		return
-	}
-	path := a.fieldValue("wsPath")
-	if path == "" {
-		path = a.st.wsPath
-	}
-	if path == "" {
-		a.st.status = "先填一个路径，或在下面的目录里点进去挑一个"
-		a.st.statusOK = false
-		return
-	}
-	a.st.wsSetBusy = true
-	a.st.status = "正在设置工作区…"
-	a.st.statusOK = true
-	go func() {
-		ls, err := a.plug.wsSetRoot(path)
-		a.results <- outcome{kind: "ws", ws: &ls, err: err, note: ls.Note}
-	}()
-}
-
-// toggleSelected 启停当前选中的插件。
-func (a *app) toggleSelected() {
-	if a.st.pluginBusy {
-		return
-	}
-	p, ok := a.selected()
-	if !ok {
-		return
-	}
-	if p.Self {
-		a.st.status = "这个插件不能停用：停掉之后就没法管理插件了"
-		a.st.statusOK = false
-		return
-	}
-	enable := p.Disabled // 当前是禁用的就启用，反之禁用
-	verb := "禁用"
-	if enable {
-		verb = "启用"
-	}
-	a.st.pluginBusy = true
-	a.st.status = "正在" + verb + " " + p.ID + "…"
-	a.st.statusOK = true
-	go func() {
-		note, err := a.plug.setPluginEnabled(p.ID, p.Dir, enable)
-		a.results <- outcome{kind: "status", note: note, err: err}
-		a.finishPluginAction()
-	}()
-}
-
-// deleteSelected 删除当前选中的插件。
-func (a *app) deleteSelected() {
-	if a.st.pluginBusy {
-		return
-	}
-	p, ok := a.selected()
-	if !ok {
-		return
-	}
-	if p.Self {
-		a.st.status = "这个插件不能删除"
-		a.st.statusOK = false
-		return
-	}
-	a.st.pluginBusy = true
-	a.st.status = "正在删除 " + p.ID + "…"
-	a.st.statusOK = true
-	go func() {
-		note, err := a.plug.deletePlugin(p.ID, p.Dir)
-		a.results <- outcome{kind: "status", note: note, err: err}
-		a.finishPluginAction()
-	}()
-}
-
-// finishPluginAction 操作收尾：解除按钮置灰并重新扫描插件清单。
-func (a *app) finishPluginAction() {
-	a.post(func() { a.st.pluginBusy = false })
-	a.refreshPlugins()
-}
-
-func (a *app) fieldValue(key string) string {
-	if f := a.st.field(key); f != nil {
-		return strings.TrimSpace(f.value)
-	}
-	return ""
-}
-
 // ---------------------------------------------------------------------------
 // 编辑
 // ---------------------------------------------------------------------------
 
-// typeTarget 返回当前键入该落到哪个字段；返回 nil 表示落到聊天输入框。
-//
-// 设置页在没有任何输入框聚焦时，默认把输入落到 API Key 上：
-// 用户进设置页十有八九就是来粘密钥的，不该因为"没先点一下输入框"而打字、粘贴都没反应。
-func (a *app) typeTarget() *formField {
-	if a.st.tab == tabChat {
-		return nil
-	}
-	if f := a.st.field(a.st.focus); f != nil {
-		return f
-	}
-	if a.st.tab == tabSettings {
-		if f := a.st.field("apiKey"); f != nil {
-			a.st.focus = "apiKey"
-			return f
-		}
-	}
-	// 文件页同理：进这一页十有八九就是要填路径，不该还要先点一下输入框
-	if a.st.tab == tabFiles {
-		if f := a.st.field("wsPath"); f != nil {
-			a.st.focus = "wsPath"
-			return f
-		}
-	}
-	return nil
-}
-
 // insertRune 插入一个字符。
 //
-// 控制字符（制表符 / 换行 / 退格）一律丢弃 —— 它们多半是复制粘贴带进来的噪音，
-// 而制表符在界面里是"切页"键，放进去就等于一次粘贴把用户弹回聊天页。
+// 控制字符一律丢弃 —— 它们多半是复制粘贴带进来的噪音，而制表符在界面里是"切页"键，
+// 放进去就等于一次粘贴把用户弹回聊天页。**换行是例外**：输入框现在是多行的，
+// 粘一段多行文本正是常见用法，那些换行就该原样成为换行。
 // 真正按下的 Tab / Enter 走的是 keyTab / keyEnter，不受这里影响。
 func (a *app) insertRune(r rune, pasted bool) {
-	if r < 0x20 || r == 0x7f || (r >= 0xD800 && r <= 0xDFFF) {
+	if r != '\n' && (r < 0x20 || r == 0x7f || (r >= 0xD800 && r <= 0xDFFF)) {
 		return
 	}
+	if a.st.tab != tabChat || a.st.shareOpen || a.st.attachOpen {
+		return // 面板占着聊天区时，打字不该落到任何地方
+	}
+	a.insertAtCursor(r)
+}
 
-	f := a.typeTarget()
-	if f == nil {
-		if a.st.tab != tabChat || a.st.shareOpen || a.st.attachOpen {
-			return // 面板占着聊天区时，打字不该落到任何地方
+// insertAtCursor 在聊天输入框的光标处插入一个字符。
+func (a *app) insertAtCursor(r rune) {
+	if a.st.selOn {
+		// 选中时打字 = 替换选中段
+		a.st.input = append(append([]rune{}, a.st.input[:a.st.selA]...),
+			append([]rune{r}, a.st.input[a.st.selB:]...)...)
+		a.st.cursor = a.st.selA + 1
+		a.st.selOn = false
+		return
+	}
+	a.st.input = append(a.st.input, 0)
+	copy(a.st.input[a.st.cursor+1:], a.st.input[a.st.cursor:])
+	a.st.input[a.st.cursor] = r
+	a.st.cursor++
+}
+
+// insertNewline 在光标处插入一个换行 —— 回车现在干的就是这件事。
+//
+// 设置页的字段是单行的，换行塞进去只会变成一个看不见的字符，所以照样挡住。
+func (a *app) insertNewline() {
+	if a.st.tab != tabChat || a.st.shareOpen || a.st.attachOpen {
+		return
+	}
+	a.insertAtCursor('\n')
+}
+
+// moveInputLine 让光标在输入框的显示行之间上下走；返回 false 表示"这次不归我管"。
+//
+// 只有输入框真的不止一行时才接管 ↑↓：否则原来那套"↑↓ 选消息框 / 滚历史"
+// 会因为消息里多打了一个回车就整个失效，那才是更让人意外的事。
+func (a *app) moveInputLine(delta int) bool {
+	if !a.inputEditable() {
+		return false
+	}
+	iv := buildInputBox(a.st, a.st.w, a.st.h).view
+	if iv.rows < 2 {
+		return false
+	}
+	// 已经在第一行还按 ↑：吃掉这次按键，别让光标跳出输入框
+	a.st.cursor = iv.indexAt(clampInt(iv.cur+delta, 0, iv.rows-1), iv.col)
+	return true
+}
+
+// moveInputEdge 把光标移到当前显示行的行首 / 行尾。
+//
+// 单行时它与"整个输入的开头 / 结尾"完全等价，多行时才是行内的首尾。
+// 表单字段是单行的，Home / End 就直接到字段的开头 / 结尾。
+func (a *app) moveInputEdge(toEnd bool) {
+	if !a.inputEditable() {
+		a.st.cursor = 0
+		if toEnd {
+			a.st.cursor = len(a.st.input)
 		}
-		a.st.input = append(a.st.input, 0)
-		copy(a.st.input[a.st.cursor+1:], a.st.input[a.st.cursor:])
-		a.st.input[a.st.cursor] = r
-		a.st.cursor++
 		return
 	}
-
-	f.value += string(r)
-	f.dirty = true
-	if pasted && f.secret {
-		// 粘进密钥框时给一句确认（只说长度，绝不回显内容）
-		a.st.status = fmt.Sprintf("密钥框已收到 %d 个字符，点「保存并生效」写入", len([]rune(f.value)))
-		a.st.statusOK = true
+	iv := buildInputBox(a.st, a.st.w, a.st.h).view
+	col := 0
+	if toEnd {
+		col = 1 << 30 // 超过行长就落到行尾
 	}
+	a.st.cursor = iv.indexAt(iv.cur, col)
+	a.st.selOn = false
+}
+
+// inputEditable 表示"现在打字落在聊天输入框上"。
+func (a *app) inputEditable() bool {
+	return a.st.tab == tabChat && !a.st.shareOpen && !a.st.attachOpen
 }
 
 func (a *app) editBackspace() {
-	if f := a.typeTarget(); f != nil {
-		rs := []rune(f.value)
-		if len(rs) > 0 {
-			f.value = string(rs[:len(rs)-1])
-			f.dirty = true
-		}
+	if a.st.selOn {
+		a.st.input = append(append([]rune{}, a.st.input[:a.st.selA]...), a.st.input[a.st.selB:]...)
+		a.st.cursor = a.st.selA
+		a.st.selOn = false
 		return
 	}
 	if a.st.cursor > 0 {
@@ -2012,9 +1905,10 @@ func (a *app) editBackspace() {
 }
 
 func (a *app) editDelete() {
-	if f := a.typeTarget(); f != nil {
-		f.value = ""
-		f.dirty = true
+	if a.st.selOn {
+		a.st.input = append(append([]rune{}, a.st.input[:a.st.selA]...), a.st.input[a.st.selB:]...)
+		a.st.cursor = a.st.selA
+		a.st.selOn = false
 		return
 	}
 	if a.st.cursor < len(a.st.input) {
@@ -2023,9 +1917,6 @@ func (a *app) editDelete() {
 }
 
 func (a *app) moveCursor(delta int) {
-	if a.typeTarget() != nil {
-		return
-	}
 	a.st.cursor += delta
 	if a.st.cursor < 0 {
 		a.st.cursor = 0
@@ -2033,92 +1924,26 @@ func (a *app) moveCursor(delta int) {
 	if a.st.cursor > len(a.st.input) {
 		a.st.cursor = len(a.st.input)
 	}
+	a.st.selOn = false
 }
 
-// moveSelection 上/下键：聊天页翻历史，插件页换选中，设置页换焦点。
+// moveSelection 上/下键：聊天页翻历史。
 func (a *app) moveSelection(delta int) {
-	switch a.st.tab {
-	case tabPlugins:
-		if len(a.st.plugins) == 0 {
-			return
-		}
-		next := a.st.selectedPlugin + delta
-		if next < 0 {
-			next = 0
-		}
-		if next >= len(a.st.plugins) {
-			next = len(a.st.plugins) - 1
-		}
-		a.st.pluginScroll = clamp(next-2, 0, maxInt(0, len(a.st.plugins)-1))
-		// 键盘选择也要同步状态栏，否则状态栏会停留在上一次点击的结果上
-		a.selectPlugin(next)
-
-	case tabFiles:
-		// 上下键在目录条目之间移动；列表为空时把焦点交给输入框，方便直接打字
-		if len(a.st.wsEntries) == 0 {
-			a.st.focus = "wsPath"
-			return
-		}
-		next := clamp(a.st.wsSel+delta, 0, len(a.st.wsEntries)-1)
-		a.st.wsSel = next
-		a.st.wsScroll = clamp(next-2, 0, maxInt(0, len(a.st.wsEntries)-1))
-		e := a.st.wsEntries[next]
-		if e.Dir {
-			a.st.status = "目录 " + e.Name + "：点它 / 回车进入"
-		} else {
-			a.st.status = "文件 " + e.Name + "（" + humanSize(e.Size) + "）"
-		}
-		a.st.statusOK = true
-
-	case tabSettings:
-		// 上下键在设置页的控件之间移动（字段 + 按钮）
-		if a.st.field(a.st.focus) == nil && !strings.HasPrefix(a.st.focus, "btn:") {
-			a.st.focus = "apiKey"
-			return
-		}
-		a.cycleFocus(delta)
-
-	default:
-		a.scrollBy(delta)
-	}
+	a.scrollBy(delta)
 }
 
 // scrollBy 滚动当前页面（滚轮为正表示向下）。
 func (a *app) scrollBy(delta int) {
-	switch a.st.tab {
-	case tabPlugins:
-		a.st.pluginScroll = clamp(a.st.pluginScroll+delta, 0, maxInt(0, len(a.st.plugins)-1))
-	case tabFiles:
-		a.st.wsScroll = clamp(a.st.wsScroll+delta, 0, maxInt(0, len(a.st.wsEntries)-1))
-	default:
-		a.st.scroll = clamp(a.st.scroll-delta, 0, maxInt(0, len(a.st.msgs)*6))
+	if a.st.tab == tabPanel {
+		// 滚轮交给插件页面自己：滚到哪儿由它决定，我们只把"想滚多少"传下去，
+		// 再按它夹过的位置记账（见 applyOutcome 的 page 分支）。
+		a.st.pageScroll = clampInt(a.st.pageScroll+delta, 0, a.st.pageMax)
+		return
 	}
+	a.st.scroll = clamp(a.st.scroll-delta, 0, maxInt(0, len(a.st.msgs)*6))
 }
 
 func (a *app) enter() {
-	// 文件页：回车 = 把输入框里的路径设为工作区（填完不用再去点按钮）
-	if a.st.tab == tabFiles {
-		a.setWorkspaceRoot()
-		return
-	}
-	if a.st.tab == tabSettings {
-		// 焦点在按钮上：回车就是按下去
-		if key, ok := strings.CutPrefix(a.st.focus, "btn:"); ok {
-			a.press(key)
-			return
-		}
-		// 焦点在「限制/不限制」上：回车就是选中它
-		if key, ok := strings.CutPrefix(a.st.focus, "budget:"); ok {
-			a.pickBudgetMode(key == "unlimited")
-			return
-		}
-		// 在字段上：回车 = 交给下一个控件。
-		// 刻意不清空焦点 —— 清空的话紧接着的粘贴又会没有落点，用户又得先点一下输入框。
-		a.cycleFocus(1)
-		a.st.status = "输入已确认，点「保存并生效」写入"
-		a.st.statusOK = true
-		return
-	}
 	if a.st.tab != tabChat || a.st.shareOpen {
 		return
 	}
@@ -2196,8 +2021,10 @@ func (a *app) render() {
 	a.st.w, a.st.h = w, h
 
 	a.canv = renderFrame(a.st, w, h, a.term.color)
-	// 渲染时登记了"要显示但还没读"的图片，这里派出去读（读完会重绘一帧）
+	// 渲染时登记了"要显示但还没读"的东西，这里派出去读（读完会重绘一帧）：
+	// 图片缩略图，以及插件自带页面的那一帧。
 	a.pumpThumbs()
+	a.pumpPages()
 	frame := a.canv.frame()
 	cursor := cursorSeq(a.st, w, h)
 
@@ -2216,7 +2043,9 @@ func cursorSeq(st *state, w, h int) string {
 	if st.tab != tabChat || w < 44 || st.shareOpen || st.attachOpen {
 		return "\033[?25l"
 	}
-	return fmt.Sprintf("\033[%d;%dH\033[?25h", h-1, cursorPos(st, w)+1)
+	// 行与列都取自同一份测算：输入框是多行的，光标会出现在其中任意一行
+	box := buildInputBox(st, w, h)
+	return fmt.Sprintf("\033[%d;%dH\033[?25h", box.cursorRow(h), box.cursorCol())
 }
 
 // ---------------------------------------------------------------------------

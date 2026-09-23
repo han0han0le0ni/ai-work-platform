@@ -1,12 +1,12 @@
 {
   "id": "com.official.llm",
   "name": "LLM",
-  "description": "LLM 插件：把消息与工具定义翻译成模型调用（OpenAI 兼容 / Ollama / 离线 mock），统一返回文本与工具调用",
-  "version": "1.0.0",
+  "description": "LLM 插件：把消息与工具定义翻译成模型调用（OpenAI 兼容 / Ollama / 离线 mock），统一返回文本与工具调用。自带界面：模型接入（平台预设 / 本机扫描 / 密钥 / 协议 / 识图）",
+  "version": "1.1.0",
   "apiVersion": "1",
   "entry": "main",
   "runtime": "binary",
-  "provides": ["llm.v1"],
+  "provides": ["llm.v1", "ui.page.llm.v1"],
   "consumes": [],
   "permissions": ["network"],
   "compat": {

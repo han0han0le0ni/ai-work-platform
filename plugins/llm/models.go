@@ -14,6 +14,13 @@ type modelsParams struct {
 	APIKey   string `json:"apiKey,omitempty"`
 }
 
+// modelListTimeoutMs 是「获取模型清单」的硬超时（毫秒）。
+//
+// 这是一次轻量 GET，服务正常时几十毫秒就回；20 秒还没回就是地址不对 /
+// 协议不对 / 服务不可达。宁可早失败让界面恢复，也别让用户对着一句
+// 「正在获取…」干等两分钟。
+const modelListTimeoutMs = 20000
+
 // models 向服务端要一份**真正可用**的模型清单。
 //
 // 这是"别让用户手打模型名"的关键：OpenAI 兼容接口都提供 GET /models，
@@ -58,23 +65,33 @@ func (l *LLM) models(args json.RawMessage) (any, error) {
 	}
 
 	l.ctx.Log("info", "拉取模型列表", map[string]any{"provider": cfg.Provider, "url": url})
-	status, body, err := l.doRequest("GET", url, nil, headers, cfg.TimeoutMs)
+	// 模型清单是轻量请求，不值得按聊天请求的超时（默认 120s）去等：
+	// 20 秒没响应基本就是地址不对、协议不对或服务不可达 —— 用户还等着界面恢复呢。
+	t := cfg.TimeoutMs
+	if t <= 0 || t > modelListTimeoutMs {
+		t = modelListTimeoutMs
+	}
+	status, body, err := l.doRequest("GET", url, nil, headers, t)
 	if err != nil {
 		return nil, err
 	}
+	// 协议选错时（Ollama 去问 /models、OpenAI 服务被问 /api/tags）失败形态五花八门：
+	// 404 的、回 200 却带 error 的、回 200 但结构对不上的都有。统一在这里认一次。
+	hint := protocolMismatchHint(body, cfg.Provider == "ollama")
 	switch {
 	case status == 401 || status == 403:
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"接口拒绝了这个密钥（HTTP %d）：检查 API Key 是否填对、是否已开通", status)
+			"接口拒绝了这个密钥（HTTP %d）：检查 API Key 是否填对、是否已开通%s",
+			status, authHint(status, cfg.BaseURL))
 	case status < 200 || status >= 300:
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"获取模型列表失败（HTTP %d）：%s", status, clipRunes(body, 200))
+			"获取模型列表失败（HTTP %d）：%s%s", status, clipRunes(body, 200), hint)
 	}
 
 	list := parseModelList(body)
 	if len(list) == 0 {
 		return nil, plugin.Errorf(plugin.CodeInternalError,
-			"接口返回里没找到模型名称：%s", clipRunes(body, 200))
+			"接口返回里没找到模型名称：%s%s", clipRunes(body, 200), hint)
 	}
 	sort.Strings(list)
 	return map[string]any{

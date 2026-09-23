@@ -45,6 +45,13 @@ const (
 	keyCtrlL
 	keyCtrlC
 
+	// keyCtrlQ：退出。和 Ctrl+C（复制）分开 —— 复制和退出挤在一个键上，
+	// 拖选想复制却因为没选中而把程序关了，是这里最吓人的误触。
+	keyCtrlQ
+
+	// keyCtrlEnter：发送。回车本身已经改成换行了，键盘用户需要这样一个送出口。
+	keyCtrlEnter
+
 	// Alt+方向键：挪浮窗。
 	//
 	// 不先"点一下选中"再挪：浮窗挡住了什么、该挪到哪儿，用户在按之前就看见了，
@@ -202,6 +209,8 @@ func (p *eventParser) feed(b byte) []event {
 		return []event{keyEvent(keyCtrlC)}
 	case 0x0c:
 		return []event{keyEvent(keyCtrlL)}
+	case 0x11:
+		return []event{keyEvent(keyCtrlQ)}
 	}
 	if b < 0x20 {
 		return nil

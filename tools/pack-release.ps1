@@ -42,7 +42,7 @@ $appName = (Get-Content -Raw -Encoding UTF8 (Join-Path $root "launcher\name.txt"
 
 # 与 build.ps1 / Makefile 的 GO_PLUGINS 保持一致：只有这些会被打进发布包
 $plugins = @(
-  "fs-tool", "llm", "tool-executor", "agent", "session", "conversation",
+  "fs-tool", "llm", "tool-executor", "agent", "session", "conversation", "roleplay",
   "workbench", "plugin-manager", "workspace", "builder", "imagegen",
   "svgdraw", "usage-monitor"
 )

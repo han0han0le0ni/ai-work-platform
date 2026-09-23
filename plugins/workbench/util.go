@@ -51,6 +51,24 @@ func maskForDisplay(key string) string {
 	return key[:4] + "****" + key[len(key)-4:]
 }
 
+// portOf 从地址里抠出端口。
+//
+// 本机服务排查时，端口是最需要照抄的一串数字（"我明明装的是 LM Studio，
+// 它却在 1234 而不是 8000"），而完整的 Base URL 往往在界面上被截掉尾巴。
+func portOf(baseURL string) string {
+	s := strings.TrimSpace(baseURL)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexAny(s, "/?#"); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		return strings.TrimSpace(s[i+1:])
+	}
+	return ""
+}
+
 // prettyJSONAny 把任意值格式化成缩进 JSON。
 func prettyJSONAny(v any) string {
 	blob, err := json.MarshalIndent(v, "", "  ")

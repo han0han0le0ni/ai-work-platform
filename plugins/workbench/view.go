@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -13,39 +12,29 @@ import (
 
 type tabKind int
 
+// 内置页现在只剩「聊天」这一页 —— 对话是界面存在的理由，不属于任何插件。
+// 其余的一律由插件自带（tabPanel）—— 装一个带界面的插件就多一页，
+// 这个文件一行都不用改。
 const (
 	tabChat tabKind = iota
-	tabPlugins
-	tabFiles
-	tabSettings
+	tabPanel
 )
 
-var allTabs = []tabKind{tabChat, tabPlugins, tabFiles, tabSettings}
+var allTabs = []tabKind{tabChat}
 
 func (t tabKind) key() string {
-	switch t {
-	case tabPlugins:
-		return "plugins"
-	case tabFiles:
-		return "files"
-	case tabSettings:
-		return "settings"
-	default:
-		return "chat"
+	if t == tabPanel {
+		return "panel"
 	}
+	return "chat"
 }
 
 func (t tabKind) label() string {
-	switch t {
-	case tabPlugins:
-		return "插件"
-	case tabFiles:
-		return "文件"
-	case tabSettings:
-		return "设置"
-	default:
-		return "聊天"
+	if t == tabPanel {
+		// 插件页的标签名由插件自己给（见 renderTabs），这里只是兜底
+		return "插件页"
 	}
+	return "聊天"
 }
 
 // msgView 是渲染一条消息需要的全部信息。
@@ -79,46 +68,28 @@ type serviceStatus struct {
 	note     string
 }
 
-// pluginInfo 是界面上展示的一个插件。
+// pluginInfo 是界面自己扫出来的一个插件摘要。
 //
 // 数据来自磁盘上的 manifest.json：核心没有"列出插件"的接口（规范 1.5 只有 6 个），
-// 界面就像普通插件那样，经能力代理把 plugins/ 目录读出来。好处是**新装的插件会自动出现**，
-// 界面不需要认识任何具体插件。
+// 界面就像普通插件那样，经能力代理把 plugins/ 目录读出来。好处是**新装的插件会自动出现**。
+//
+// 界面拿它只做两件事：
+//
+//  1. 认出哪些插件提供了"自带页面"（ui.page.*），好把它们合成到标签栏里；
+//  2. 说清楚侧栏里某个服务此刻是谁在提供。
+//
+// 插件本身的管理（清单、详情、启停、删除）是 pluginManager.v1 的事，
+// 由它自带的那一页负责展示 —— 界面不再留第二份副本。所以那些"名字、版本、
+// 简介、依赖、权限"之类的字段都随插件页搬走了，这里只留上面两件事用得上的。
 type pluginInfo struct {
-	ID          string
-	Name        string
-	Version     string
-	Description string
-	Runtime     string
-	Entry       string
-	Dir         string // 目录名，例如 demo.plugin；被禁用时带 .disabled 后缀
-	Disabled    bool   // 目录带 .disabled：重启后核心不再加载它
-	Self        bool   // 是不是插件管理器自己（不可停用 / 不可删除）
-	Provides    []string
-	Consumes    []string
-	Permissions []string
-	Deps        []string
-	Compat      string
-	Alive       []string // 声明里现在能发现到的服务
-	Dead        []string // 声明了但发现不到的服务（没启动 / 跳过了 / 崩了）
-	ReadErr     string
+	ID       string
+	Dir      string   // 目录名，例如 demo.plugin；被禁用时带 .disabled 后缀
+	Provides []string // manifest 声明的服务
+	Alive    []string // 声明里现在能发现到的服务
+	ReadErr  string   // manifest 读不出来时的原因
 }
 
 func (p pluginInfo) running() bool { return len(p.Alive) > 0 }
-
-type formField struct {
-	key    string
-	label  string
-	value  string
-	hint   string
-	secret bool
-
-	// dirty 表示用户手动改过这个字段。
-	//
-	// 后台刷新（启动时读配置、保存后回读）不许覆盖用户正在输入的内容 ——
-	// 否则粘了一半密钥时来一次刷新，前功尽弃。
-	dirty bool
-}
 
 type state struct {
 	coreVersion string
@@ -141,25 +112,24 @@ type state struct {
 	spinner  int
 	scroll   int
 
+	// 聊天输入框的鼠标选择（rune 下标，前闭后开）。selOn 为 false 时 selA/selB 无效。
+	selOn      bool
+	selA, selB int
+
+	// 正在进行的鼠标拖动（选文本）。nil 表示没在拖。
+	drag *dragSel
+
 	// trace 是「AI 在干什么」的过程记录：模型在想什么、调了哪些工具、卡在哪。
 	//
 	// 它由事件总线喂进来（见 activity.go），生成结束后**不**立刻清掉 ——
 	// 留着让人回看，下一次发消息时才换新的。
 	trace *traceView
 
-	// 用量浮窗（见 float.go）。
-	//
-	// 数据是 usage-monitor 广播来的；位置归用户 —— 拖到哪儿就停在哪儿，
-	// -1 表示"还没拖过"，这时贴在右上角。
-	usage     usageSnapshot
-	usageOK   bool
-	floatX    int
-	floatY    int
-	floatFold bool
-	floatDrag *floatDrag
-
-	// floatSave 把浮窗位置写回插件配置。界面线程不做 RPC，所以由插件层注入。
-	floatSave func(x, y int, fold bool)
+	// 通用浮窗（ui.widget.*）：见 widget.go。每个浮窗一份状态，位置归用户。
+	widgets    []widgetView
+	widgetDrag *widgetDrag
+	// widgetSave 把某个浮窗的位置落盘。界面线程不做 RPC，由插件层注入。
+	widgetSave func(svc, id string, x, y int, fold bool)
 
 	// 修改某条消息：输入行临时被这条消息占住，回车提交成一个新版本
 	editing  string // 正在修改的消息 id；空串表示普通发送
@@ -191,52 +161,71 @@ type state struct {
 	noticeOK bool
 
 	// 侧栏 / 插件页
-	services       []serviceStatus
-	plugins        []pluginInfo
-	pluginScroll   int
-	selectedPlugin int
-	pluginBusy     bool // 启停 / 删除进行中：按钮置灰，防重复点击
-	confirmDelete  bool // 删除的二次确认：删除不可逆，必须再点一次
+	services []serviceStatus
+	// plugins 是扫出来的插件清单。界面只用它做两件事：认出 ui.page.* 的提供者、
+	// 说清侧栏某个服务是谁在提供（见 pluginInfo）。
+	plugins []pluginInfo
 
-	// 设置页
-	provider  string // llm.v1 的 provider：mock / openai / ollama
-	presetKey string // 当前选中的服务预设
-	fields    []formField
-	focus     string
-	status    string
-	statusOK  bool
+	// droppedPlugins 是本次运行里"已经被删掉"的插件（按 ID 与目录名记）。
+	//
+	// 删除是**重启生效**的：正在运行的插件目录被占用、删不掉，只是标了"待重启
+	// 删除"，目录此刻还在。所以光重扫没用 —— 扫描还是会看到它。界面得记住
+	// "它被删了"，重扫结果里把它的条目滤掉，否则它的页面会一直赖在标签栏上。
+	droppedPlugins map[string]bool
 
-	// 模型选择
-	modelList  []string // 可点选的模型（来自预设或服务端）
-	modelsNote string   // 模型区的一句话说明
-	modelsBusy bool
+	// focus 现在只剩一个用途：标记键盘焦点在聊天输入框上（"chat"）。
+	focus    string
+	status   string
+	statusOK bool
 
-	// 设置页 · AI 预算（工具调用轮数上限，可设为不限制）
-	budgetUnlimited bool
-	budgetLoaded    bool
-	budgetBusy      bool
-	budgetNote      string
+	// 插件自带的页面（ui.page.*）：见 panel.go。
+	//
+	// 这几项是"借地方"这件事本身的账：页面清单、当前看的是哪一页、
+	// 拿回来的帧缓存、这一帧登记的热区。至于页面上有什么，宿主一概不知道。
+	pages     []pagePanel
+	pagesBusy bool
+	// pagesSeen 是"上一次扫目录时，哪些服务声称自己带页面"。
+	//
+	// 页面清单只在**这组服务变过**时才重新去问。以前是"清单为空才补问"
+	// （为了接住启动竞态），那样删掉一个插件之后它的页面会永远留在标签栏上：
+	// 清单非空，就再也没人去问第二次。
+	pagesSeen    []string
+	pageSvc      string // 当前这一页是谁提供的
+	pageID       string
+	pageTitle    string
+	pageScroll   int
+	pageMax      int
+	pageNote     string
+	pageWantKeys bool
+	// pageWantCopy 表示当前这一页声明了"有可选的文本"，Ctrl+C 交它复制。
+	pageWantCopy bool
 
-	// 文件页：挑工作目录（点目录进入）或直接填路径
-	wsRoot    string     // 当前工作目录
-	wsPath    string     // 正在浏览的目录
-	wsParent  string     // 上一级
-	wsEntries []dirEntry // 当前目录条目
-	wsSel     int        // 选中行
-	wsScroll  int
-	wsBusy    bool // 正在读目录
-	wsSetBusy bool // 正在设置工作区（与读目录分开：读着的时候也该能按回车设置）
+	pageCache   map[string]*pageRender
+	pagePending map[string]bool
+	pageWanted  []pageReq
+	pageHits    []pageHitRef
 
 	events []string
 }
 
-// floatDrag 是一次拖动浮窗的中间状态。
-type floatDrag struct {
-	gx, gy int  // 按下处相对浮窗左上角的偏移：抓哪儿就从哪儿跟，浮窗不会先跳一下
-	moved  bool // 真的挪过 —— 松手时据此区分"拖动"和"轻点收起"
+// dragSel 是一次"按住鼠标拖选"的中间状态。
+//
+// 起点按下时就记下：拖到哪里都以它为基准算选区，鼠标甩出输入框再回来也不会乱。
+// target 是 "chat"（聊天输入框）、字段 key（旧接口），或 "panel"（插件页面）。
+// 前两者用 fx/anchor 自己换算列；"panel" 不换算 —— 插件为字段的每一列都登记了
+// caret 热区，拖到哪个热区就把哪个热区的列号转过去。
+type dragSel struct {
+	target string
+	anchor int
+	fx     int
+
+	// panel 拖选用：哪一页的哪个字段
+	svc   string
+	id    string
+	field string
 }
 
-// dirEntry 是文件页里的一行：一个文件或目录。
+// dirEntry 是附件面板里的一行：一个文件或目录。
 type dirEntry struct {
 	Name string
 	Dir  bool
@@ -267,16 +256,6 @@ func (a attachment) kind() string {
 	default:
 		return "file"
 	}
-}
-
-// field 按 key 找字段。
-func (st *state) field(key string) *formField {
-	for i := range st.fields {
-		if st.fields[i].key == key {
-			return &st.fields[i]
-		}
-	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -327,10 +306,23 @@ func renderFrame(st *state, w, h int, color bool) *canvas {
 	c.rows = append(c.rows, borderTop(w, "AI 工作平台 · 工作台", titleRight(st), color))
 	renderTabs(c, st)
 
-	bodyH := h - 5
+	// 每帧重算：这一帧"想要哪些页的帧"、登记了哪些热区。
+	// 渲染是同步的，不能在里面发 RPC（见 panel.go 的 pumpPages）。
+	st.pageWanted = nil
+	st.pageHits = nil
 
-	// 设置页表单是全宽的；聊天/插件页在够宽时才分栏
-	two := st.tab != tabSettings && w >= sidebarMinW
+	// 输入框会随内容长高（多行输入），版面得先给它让位。
+	// 用 buildInputBox 算而不是自己数，是为了和渲染、光标三处永远一致。
+	bodyH := h - 4 - buildInputBox(st, w, h).rows
+	if bodyH < bodyMinH {
+		bodyH = bodyMinH
+	}
+
+	// 插件自带的一页自己排版，占满整块正文区 —— 别让宿主的分栏去猜它想要什么。
+	full := st.tab == tabPanel
+
+	// 够宽就分两栏。
+	two := w >= sidebarMinW && !full
 	leftW, rightW := w-2, 0
 	if two {
 		rightW = sidebarW
@@ -339,14 +331,8 @@ func renderFrame(st *state, w, h int, color bool) *canvas {
 
 	var leftRows, rightRows []rowFn
 	switch st.tab {
-	case tabPlugins:
-		leftRows = pluginListRows(st, leftW, bodyH)
-		rightRows = pluginDetailRows(st, rightW, bodyH)
-	case tabFiles:
-		leftRows = filesRows(st, leftW, bodyH)
-		rightRows = fileDetailRows(st, rightW, bodyH)
-	case tabSettings:
-		leftRows = settingsRows(st, w-2, bodyH)
+	case tabPanel:
+		leftRows = pageRows(st, leftW, bodyH)
 	default:
 		if st.attachOpen {
 			// 附件面板借聊天区的两栏：左边挑文件，右边看已选
@@ -373,8 +359,8 @@ func renderFrame(st *state, w, h int, color bool) *canvas {
 	renderFooter(c, st)
 	c.rows = append(c.rows, borderBottom(w, hintFor(st), color))
 
-	// 浮窗最后画：它盖在版面之上，所以最后一步才贴（见 float.go）
-	drawFloat(c, st)
+	// 浮窗最后画：它盖在版面之上，所以最后一步才贴（见 widget.go）
+	drawWidgets(c, st)
 	return c
 }
 
@@ -394,12 +380,13 @@ func titleRight(st *state) string {
 
 func hintFor(st *state) string {
 	switch st.tab {
-	case tabPlugins:
-		return "单击插件看详情 · 可点「启用/禁用」与「删除」（删除要二次确认） · 重启后生效 · Ctrl+C 退出"
-	case tabFiles:
-		return "填路径后回车 · 点目录进入 · 点「向上一级」返回 · 走到哪点「设为工作区」 · Ctrl+C 退出"
-	case tabSettings:
-		return "点服务 → 粘密钥 → 保存 · Tab 换输入框 · Esc 后 Tab 切页 · Ctrl+C 退出"
+	case tabPanel:
+		// 这一行由插件自己给（render 的 note）：它比谁都清楚自己这一页怎么用。
+		// 插件没给就退回一句通用说明，而不是留空 —— 空行看起来像界面坏了。
+		if st.pageNote != "" {
+			return st.pageNote
+		}
+		return "这一页由「" + pageRefName(st) + "」插件自己绘制 · Tab 切页 · Ctrl+C 复制 · Ctrl+Q 退出"
 	default:
 		// 底部这一行优先说刚发生过什么：复制、导出、失败原因……
 		// 那些结果没别的地方能显示，而这一行本来就空着。
@@ -407,12 +394,12 @@ func hintFor(st *state) string {
 			return st.notice
 		}
 		if st.attachOpen {
-			return "点文件名加入附件 · 点目录进去 · ↑↓ 选择 · 回车加选中项 · Esc 关闭 · 关掉后回车发送"
+			return "点文件名加入附件 · 点目录进去 · ↑↓ 选择 · 回车加选中项 · Esc 关闭 · 关掉后点「发送」送出"
 		}
 		if st.editing != "" {
-			return "回车 = 提交为新版本（旧版本与它后面那条时间线都保留） · Esc = 放弃修改"
+			return "回车换行 · 点「提交」存为新版本（旧版本与它后面那条时间线都保留）· Esc 放弃修改"
 		}
-		return "Enter 发送 · 点消息框上的「修改 / 重新生成 / 分享」· 点 ‹ n/n › 翻版本 · 滚轮翻历史 · 拖浮窗挪位 · Alt+方向键也可挪 · Tab 切页"
+		return "回车换行 · 点「发送」送出（Ctrl+Enter 同）· 点消息框上的「修改 / 重新生成 / 分享」· 滚轮翻历史 · Tab 切页"
 	}
 }
 
@@ -420,18 +407,68 @@ func hintFor(st *state) string {
 // 标签栏
 // ---------------------------------------------------------------------------
 
+// tabTarget 是标签栏上的一个标签：内置的一页，或者插件自带的一页。
+type tabTarget struct {
+	kind   tabKind
+	svc    string // kind == tabPanel 时：提供这一页的服务
+	panel  string // kind == tabPanel 时：页面 id
+	label  string
+	action string // 点击动作
+}
+
+// matches 判断这个标签是不是"现在正看着的那一页"。
+func (t tabTarget) matches(st *state) bool {
+	if st.tab != t.kind {
+		return false
+	}
+	if t.kind != tabPanel {
+		return true
+	}
+	return st.pageSvc == t.svc && st.pageID == t.panel
+}
+
+// allTabsOf 返回当前这一屏有哪些标签：内置几页 + 插件报上来的每一页。
+//
+// 这是"装一个插件就多一页"的落点：新页面从哪来、叫什么，界面一概不问，
+// 清单里有什么就画什么。
+func allTabsOf(st *state) []tabTarget {
+	out := make([]tabTarget, 0, len(allTabs)+len(st.pages))
+	for _, t := range allTabs {
+		out = append(out, tabTarget{kind: t, label: t.label(), action: "tab:" + t.key()})
+	}
+	for _, p := range st.pages {
+		label := firstNonEmpty(p.title, p.id)
+		if st.tab == tabPanel && st.pageSvc == p.svc && st.pageID == p.id && st.pageTitle != "" {
+			label = st.pageTitle // 插件可以随状态改标签（比如带上条数）
+		}
+		out = append(out, tabTarget{
+			kind: tabPanel, svc: p.svc, panel: p.id,
+			// 名字太长会把标签栏撑爆，插件给多长都得先夹一刀
+			label:  truncDisplay(label, 8),
+			action: "tab:page:" + p.svc + "/" + p.id,
+		})
+	}
+	return out
+}
+
 func renderTabs(c *canvas, st *state) {
 	c.row(func(l *lineBuilder, y int) {
 		l.styled(cBorder, "│")
 		x := 1
-		for _, t := range allTabs {
-			label, style := " "+t.label()+" ", cDim
-			if st.tab == t {
-				label, style = "["+t.label()+"]", cAccent+cBold
+		for _, t := range allTabsOf(st) {
+			label, style := " "+t.label+" ", cDim
+			if t.matches(st) {
+				label, style = "["+t.label+"]", cAccent+cBold
+			}
+			wid := dispWidth(label)
+			// 放不下就不画：画到框外的标签热区还在、人却看不见，点上去"时灵时不灵"。
+			// 插件给的名字长短不一，所以这一道必须挡在这儿。
+			if x+wid+2 > c.w-1 {
+				break
 			}
 			l.styled(style, label)
-			c.box("tab:"+t.key(), x, y, dispWidth(label))
-			x += dispWidth(label)
+			c.box(t.action, x, y, wid)
+			x += wid
 			l.styled("", "  ")
 			x += 2
 		}
@@ -459,15 +496,8 @@ func renderTabs(c *canvas, st *state) {
 
 func (st *state) summary() string {
 	switch st.tab {
-	case tabPlugins:
-		return fmt.Sprintf("插件 %d/%d", countRunning(st.plugins), len(st.plugins))
-	case tabFiles:
-		if st.wsRoot == "" {
-			return "工作区：未指定"
-		}
-		return "工作区：" + truncDisplay(st.wsRoot, 40)
-	case tabSettings:
-		return "当前 provider：" + st.provider
+	case tabPanel:
+		return "插件页面 · " + truncDisplay(pageRefName(st), 20)
 	default:
 		if st.convOK {
 			return fmt.Sprintf("消息 %d · 会话 %d", countRealMsgs(st), len(st.sessions))
@@ -481,16 +511,6 @@ func countRealMsgs(st *state) int {
 	n := 0
 	for _, m := range st.msgs {
 		if m.id != "" {
-			n++
-		}
-	}
-	return n
-}
-
-func countRunning(ps []pluginInfo) int {
-	n := 0
-	for _, p := range ps {
-		if p.running() {
 			n++
 		}
 	}
@@ -944,332 +964,17 @@ func sessByID(list []sessionInfo, id string) (sessionInfo, bool) {
 }
 
 // ---------------------------------------------------------------------------
-// 插件页
+// 插件页整块搬去了插件管理器自己身上（plugins/plugin-manager/panel.go）——
+// 清单、详情、启停、删除都是它自己的事，界面不该再留一份副本。
+// 界面这边只留"扫一遍插件目录"这一件事：认出自带页面的插件（ui.page.*），
+// 以及说清侧栏里某个服务是谁在提供（见 pluginInfo）。
 // ---------------------------------------------------------------------------
 
-// countSameID 数一数目录里躺着几份这个 ID。
-//
-// 正常只有一份；装了 x.plugin 又留着 x.plugin.disabled 就是两份，
-// 而两份的 ID 一模一样 —— 不把目录名摆出来，用户分不清自己点的是哪份。
-func countSameID(ps []pluginInfo, id string) int {
-	n := 0
-	for _, p := range ps {
-		if p.ID == id {
-			n++
-		}
-	}
-	return n
-}
+// 「文件」页整块搬去了 workspace 插件自己身上（见 plugins/workspace/panel.go）——
+// 那一页是"挑工作目录"，属于工作区插件自己的事，界面不该替它画。
+// 搬过去之后：改那一页不用碰这个插件，换个 UI 插件它也照样在。
 
-func pluginListRows(st *state, w, bodyH int) []rowFn {
-	var body []rowFn
-
-	body = append(body, func(c *canvas, l *lineBuilder, y, x int) {
-		x = c.button(l, y, x, "btn:rescan", "重新扫描", false)
-		l.styled(cDim, truncDisplay(st.status, w-dispWidth(" 重新扫描 ")-4))
-	})
-
-	if len(st.plugins) == 0 {
-		body = append(body, textRow(newCell(segment{cDim, "  没有读到插件目录"}), w))
-	}
-
-	for i, p := range st.plugins {
-		pl, idx := p, i
-		body = append(body, func(c *canvas, l *lineBuilder, y, x int) {
-			// 禁用的那份不算"运行中"：这一份重启后根本不会被加载，
-			// 服务是同 ID 的另一份在提供。画成 ✓ 就成了两条一模一样的插件。
-			mark, style := "✗", cBad
-			switch {
-			case pl.Disabled:
-				mark, style = "✗", cDim
-			case pl.running():
-				mark, style = "✓", cOK
-			}
-			if idx == st.selectedPlugin {
-				style = cSelBG + cBold + style
-			}
-			id := truncDisplay(pl.ID, w-16)
-			if pl.Disabled {
-				id = truncDisplay(pl.ID+"（禁用）", w-16)
-			}
-			l.styled(style, " "+mark+" ")
-			l.styled(style, padDisplay(id, w-16))
-			l.styled(cDim, truncDisplay("v"+pl.Version, 10))
-			l.pad(w)
-			// 动作名用行号而不是插件 ID：两份 ID 相同的插件会登记出两个同名的框，
-			// 命中时永远落在前一个上 —— 后一份就成了点不动的死行。
-			c.box("plugin:"+strconv.Itoa(idx), x, y, w)
-		})
-	}
-
-	return windowRows(body, st.pluginScroll, bodyH)
-}
-
-func pluginDetailRows(st *state, w, bodyH int) []rowFn {
-	if w <= 0 {
-		return nil
-	}
-	if len(st.plugins) == 0 {
-		return []rowFn{textRow(newCell(segment{cDim, "  未选中插件"}), w)}
-	}
-	i := st.selectedPlugin
-	if i < 0 || i >= len(st.plugins) {
-		i = 0
-	}
-	p := st.plugins[i]
-
-	var out []rowFn
-	add := func(s string, style string) {
-		out = append(out, textRow(newCell(segment{style, " " + truncDisplay(s, w-2)}), w))
-	}
-	add("插件详情", cDim+cBold)
-	if p.ReadErr != "" {
-		add("读取失败："+p.ReadErr, cBad)
-		return out
-	}
-
-	add(p.ID, cAccent+cBold)
-	if p.Name != "" && p.Name != p.ID {
-		add(p.Name, "")
-	}
-	if p.Dir != "" {
-		add("目录   "+p.Dir, cDim)
-	}
-	// 目录里躺着两份 ID 相同的插件时（一份 .plugin、一份 .plugin.disabled），
-	// 光看名字分不出谁是谁，得把目录名和"只对这份生效"说清楚。
-	if n := countSameID(st.plugins, p.ID); n > 1 {
-		out = append(out, textRow(plainCell(""), w))
-		for _, ln := range wrapText("目录里有 "+strconv.Itoa(n)+
-			" 份 ID 相同的插件，启停 / 删除只对选中的这一份生效", w-2) {
-			add(ln, cWarn)
-		}
-	}
-	add("版本   v"+p.Version, "")
-	add("运行时 "+p.Runtime, "")
-	add("入口   "+p.Entry, "")
-	if p.Description != "" {
-		out = append(out, textRow(plainCell(""), w))
-		for _, ln := range wrapText(p.Description, w-2) {
-			add(ln, cDim)
-		}
-	}
-
-	out = append(out, textRow(plainCell(""), w))
-	add("提供的服务", cDim+cBold)
-	if len(p.Provides) == 0 {
-		add("（无）", cDim)
-	}
-	for _, s := range p.Provides {
-		style := cBad
-		if contains(p.Alive, s) {
-			style = cOK
-		}
-		add("✓ "+s, style)
-	}
-	if len(p.Dead) > 0 {
-		add("未运行的服务", cWarn)
-		for _, s := range p.Dead {
-			add("✗ "+s, cDim)
-		}
-	}
-	add("状态   "+pluginStateText(p), stateStyle(p))
-
-	// 启停：改目录名的后缀（核心只加载 *.plugin），所以同样是重启后生效
-	out = append(out, textRow(plainCell(""), w), textRow(newCell(
-		segment{cDim + cBold, " 启停"}), w))
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		if p.Self {
-			l.styled(cDim, truncDisplay("插件管理器自己，不可停用也不可删除", w-2))
-			return
-		}
-		label, note := "禁用", " 当前：已启用，重启后照常加载"
-		if p.Disabled {
-			label, note = "启用", " 当前：已禁用，重启后不再加载"
-		}
-		cx := c.button(l, y, x+1, "btn:toggle", label, !st.pluginBusy)
-		l.styled(cDim, truncDisplay(note, maxInt(0, w-cx-2)))
-	})
-
-	// 删除不可逆：点一次只是进入确认态，再点一次"确认删除"才真的动手
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		if p.Self {
-			return
-		}
-		l.styled("", " ")
-		if st.confirmDelete {
-			cx := c.button(l, y, x+1, "btn:delconfirm", "确认删除", true)
-			_ = c.button(l, y, cx, "btn:delcancel", "取消", false)
-			return
-		}
-		cx := c.button(l, y, x+1, "btn:del", "删除插件", !st.pluginBusy)
-		l.styled(cDim, truncDisplay(" 连配置与日志一起清除", maxInt(0, w-cx-2)))
-	})
-
-	if len(p.Permissions) > 0 {
-		out = append(out, textRow(plainCell(""), w))
-		add("权限", cDim+cBold)
-		for _, s := range p.Permissions {
-			add("· "+s, "")
-		}
-	}
-	if len(p.Consumes) > 0 {
-		out = append(out, textRow(plainCell(""), w))
-		add("消费", cDim+cBold)
-		for _, s := range p.Consumes {
-			add("· "+s, "")
-		}
-	}
-	if len(p.Deps) > 0 {
-		out = append(out, textRow(plainCell(""), w))
-		add("依赖", cDim+cBold)
-		for _, s := range p.Deps {
-			add("· "+s, "")
-		}
-	}
-	if p.Compat != "" {
-		out = append(out, textRow(plainCell(""), w))
-		add("兼容核心 "+p.Compat, cDim)
-	}
-	return out
-}
-
-func pluginStateText(p pluginInfo) string {
-	switch {
-	case p.Disabled:
-		return "已禁用（重启后不再加载）"
-	case p.running() && len(p.Dead) == 0:
-		return "运行中"
-	case p.running():
-		return "部分可用"
-	case len(p.ReadErr) > 0:
-		return "无法读取"
-	default:
-		return "未运行"
-	}
-}
-
-func stateStyle(p pluginInfo) string {
-	if p.running() {
-		return cOK
-	}
-	return cBad
-}
-
-// ---------------------------------------------------------------------------
-// 文件页：挑一个文件夹当工作区
-//
-// 两条路都留着：
-//   - 选：点目录名进去、点「..」退出来，走到哪儿点「设为工作区」就是哪儿
-//   - 填：路径输入框直接打字或粘贴绝对路径，回车即可
-//
-// 终端里没有系统文件对话框，所以"选"就是这样一个可点的目录浏览器。
-// ---------------------------------------------------------------------------
-
-func filesRows(st *state, w, bodyH int) []rowFn {
-	var body []rowFn
-
-	// ① 路径：输入框直接填，下面的列表用来点选
-	body = append(body, textRow(newCell(
-		segment{cDim + cBold, " ① 路径"},
-		segment{cDim, "  直接粘贴，或点下面的目录进去挑"},
-	), w))
-	body = append(body, fieldRow(st, w, "wsPath"))
-	body = append(body, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		cx := c.button(l, y, x+1, "btn:wsset", "设为工作区", !st.wsSetBusy)
-		cx = c.button(l, y, cx, "btn:wsrefresh", "刷新", !st.wsBusy)
-		if st.wsParent != "" {
-			_ = c.button(l, y, cx, "btn:wsup", "向上一级", !st.wsBusy)
-		}
-	})
-	body = append(body, textRow(plainCell(""), w))
-
-	// ② 目录内容：目录可点进去，文件只是列出来看
-	body = append(body, textRow(newCell(
-		segment{cDim + cBold, " ② 目录"},
-		segment{cDim, "  " + truncDisplay(firstNonEmpty(st.wsPath, "（未知）"), maxInt(8, w-14))},
-	), w))
-
-	if st.wsBusy && len(st.wsEntries) == 0 {
-		body = append(body, textRow(newCell(segment{cDim, "  正在读取…"}), w))
-	}
-	if len(st.wsEntries) == 0 && !st.wsBusy {
-		body = append(body, textRow(newCell(segment{cDim, "  （空目录，或还没有读取）"}), w))
-	}
-
-	for i, e := range st.wsEntries {
-		entry, idx := e, i
-		body = append(body, func(c *canvas, l *lineBuilder, y, x int) {
-			mark, style := "·", cDim
-			if entry.Dir {
-				mark, style = "▸", cAccent
-			}
-			if idx == st.wsSel {
-				style = cSelBG + cBold + style
-			}
-			l.styled(style, " "+mark+" ")
-			l.styled(style, padDisplay(truncDisplay(entry.Name, w-16), w-16))
-			if !entry.Dir {
-				l.styled(cDim, truncDisplay(humanSize(entry.Size), 10))
-			}
-			l.pad(w)
-			// 目录点进去，文件只是选中看看
-			if entry.Dir {
-				c.box("wsdir:"+entry.Name, x, y, w)
-				return
-			}
-			c.box("wsfile:"+entry.Name, x, y, w)
-		})
-	}
-	return windowRows(body, st.wsScroll, bodyH)
-}
-
-// fileDetailRows 是文件页的右栏：当前工作区与选中条目。
-func fileDetailRows(st *state, w, bodyH int) []rowFn {
-	if w <= 0 {
-		return nil
-	}
-	var out []rowFn
-	add := func(s, style string) {
-		out = append(out, textRow(newCell(segment{style, " " + truncDisplay(s, w-2)}), w))
-	}
-
-	add("工作区", cDim+cBold)
-	if st.wsRoot == "" {
-		add("未指定", cWarn)
-		add("", "")
-		add("指定之后，workspace.v1 的所有操作", cDim)
-		add("都会被锁在这个目录里。", cDim)
-	} else {
-		add(st.wsRoot, cOK+cBold)
-	}
-
-	if st.wsSel >= 0 && st.wsSel < len(st.wsEntries) {
-		e := st.wsEntries[st.wsSel]
-		out = append(out, textRow(plainCell(""), w))
-		add("选中", cDim+cBold)
-		add(e.Name, "")
-		if e.Dir {
-			add("类型   目录", "")
-			add("", "")
-			add("点它可以进去，走到目标后", cDim)
-			add("再点「设为工作区」。", cDim)
-		} else {
-			add("类型   文件", "")
-			add(fmt.Sprintf("大小   %s", humanSize(e.Size)), "")
-		}
-	}
-	return out
-}
-
-// budgetSummary 把预算说成人话。
-func budgetSummary(b agentBudget) string {
-	if b.Unlimited {
-		return "当前：不限制，由模型自己决定何时停"
-	}
-	return fmt.Sprintf("当前：最多 %d 轮工具调用", b.Steps)
-}
+// 「模型」页搬去了 llm、预算搬去了 agent（见那两个插件的 panel.go）。
 
 // humanSize 把字节数说成一眼能读的大小。
 func humanSize(n int64) string {
@@ -1283,205 +988,6 @@ func humanSize(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
-}
-
-// ---------------------------------------------------------------------------
-// 设置页
-// ---------------------------------------------------------------------------
-
-func settingsRows(st *state, w, bodyH int) []rowFn {
-	var out []rowFn
-	blank := func() { out = append(out, textRow(plainCell(""), w)) }
-
-	section := func(title, note string) {
-		out = append(out, textRow(newCell(
-			segment{cDim + cBold, " " + title},
-			segment{cDim, "  " + note},
-		), w))
-	}
-
-	// ① 选服务：地址与默认模型一起填好，用户只需要再粘个密钥
-	section("① 选服务", "点一下，地址和模型自动填好")
-	var presets []chipItem
-	for _, p := range providerPresets {
-		presets = append(presets, chipItem{
-			action:   "preset:" + p.Key,
-			label:    p.Label,
-			selected: st.presetKey == p.Key,
-		})
-	}
-	out = append(out, chipRows(presets, w)...)
-	blank()
-
-	// ② 模型：先给几个常用的，点「获取可用模型」向服务端要真实清单
-	section("② 模型", "点「获取可用模型」向服务端要一份真实清单")
-	var models []chipItem
-	selectedModel := ""
-	if f := st.field("model"); f != nil {
-		selectedModel = f.value
-	}
-	for _, m := range st.modelList {
-		models = append(models, chipItem{action: "model:" + m, label: m, selected: m == selectedModel})
-	}
-	if len(models) > 0 {
-		out = append(out, chipRows(models, w)...)
-	}
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		x = c.button(l, y, x+1, "btn:getmodels", "获取可用模型", st.modelsBusy)
-		l.styled(cDim, truncDisplay(st.modelsNote, maxInt(0, w-x-2)))
-	})
-	blank()
-
-	// ③ API Key：切到这一页时焦点默认就在这儿，粘完直接保存
-	section("③ API Key", "直接粘贴；留空=不改动，输入一个减号=清空")
-	out = append(out, fieldRow(st, w, "apiKey"))
-	if hint := keyHintLine(st); hint != "" {
-		out = append(out, textRow(newCell(segment{cDim, "    " + truncDisplay(hint, w-6)}), w))
-	}
-	blank()
-
-	// 高级：一般不用动
-	section("高级", "自己搭的兼容接口改这里；改完点保存立即生效")
-	out = append(out, fieldRow(st, w, "baseUrl"), fieldRow(st, w, "model"))
-	blank()
-
-	// 识图模型：文字和看图分开配 —— 日常聊天用便宜快的，发了图才切到会看图的
-	section("识图模型", "带图片时改用这个；留空 = 跟上面一样，输入减号 = 清空")
-	out = append(out, fieldRow(st, w, "visionModel"))
-	blank()
-
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		x = c.button(l, y, x+1, "btn:save", "保存并生效", true)
-		_ = c.button(l, y, x, "btn:test", "测试连接", false)
-	})
-	blank()
-
-	// ④ AI 预算：模型反复调工具是常态，但"最多几轮"该由用户说了算
-	section("④ 工具调用预算", "超了就自动收手；选「不限制」则由模型自己决定何时停")
-	out = append(out, fieldRow(st, w, "agentSteps"))
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		cx := x + 1
-		cx = c.chip(l, y, cx, "budget:limited", "限制步数", !st.budgetUnlimited)
-		_ = c.chip(l, y, cx, "budget:unlimited", "不限制", st.budgetUnlimited)
-	})
-	out = append(out, func(c *canvas, l *lineBuilder, y, x int) {
-		l.styled("", " ")
-		cx := c.button(l, y, x+1, "btn:budgetsave", "应用预算", !st.budgetBusy)
-		l.styled(cDim, truncDisplay(" "+st.budgetNote, maxInt(0, w-cx-2)))
-	})
-	return out
-}
-
-// fieldRow 渲染一个可编辑输入框：点一下聚焦，聚焦后直接打字或粘贴。
-func fieldRow(st *state, w int, key string) rowFn {
-	f := st.field(key)
-	if f == nil {
-		return nil
-	}
-	return func(c *canvas, l *lineBuilder, y, x int) {
-		label := " " + padDisplay(f.label, 10)
-		l.styled(cDim, label)
-		fx := x + dispWidth(label)
-		inner := w - dispWidth(label) - 4
-		if inner < 4 {
-			inner = 4
-		}
-
-		focused := st.focus == f.key
-		style := cBorder
-		if focused {
-			style = cAccent + cBold
-		}
-
-		// 有输入就显示输入；没输入且未聚焦时，用灰色提示文字占位
-		text := truncDisplay(f.value, inner)
-		used := dispWidth(text)
-
-		l.styled(style, "[")
-		l.styled("", text)
-		if focused {
-			l.styled(cAccent2+cBold, "▏")
-			used++
-		}
-		if used < inner {
-			// 聚焦时也要显示提示：空的输入框里摆着「已配置 sk-****cdef」，
-			// 比只有一个光标更让人确认"密钥还在，只是不回显"。
-			if placeholder := f.hint; placeholder != "" && f.value == "" {
-				ph := truncDisplay(placeholder, inner-used)
-				l.styled(cDim, ph)
-				used += dispWidth(ph)
-			}
-			if used < inner {
-				l.styled("", strings.Repeat(" ", inner-used))
-			}
-		}
-		l.styled(style, "]")
-		c.box("focus:"+f.key, fx, y, inner+2)
-	}
-}
-
-// keyHintLine 给出「密钥去哪拿」的提示。
-//
-// 刻意不复用字段自己的提示（f.hint）：那个已经显示在输入框里了，
-// 再写一遍就是上下两行同样的字。
-func keyHintLine(st *state) string {
-	p, ok := presetByKey(st.presetKey)
-	switch {
-	case ok && p.KeyURL != "":
-		return "密钥在 " + p.KeyURL + " 申请"
-	case ok && !p.NeedKey:
-		return p.Label + " 不需要密钥"
-	}
-	return ""
-}
-
-// chipItem 是一个可点选项。
-type chipItem struct {
-	action   string
-	label    string
-	selected bool
-}
-
-// chipRows 把可点选项按可用宽度自动折行。
-func chipRows(items []chipItem, w int) []rowFn {
-	var rows []rowFn
-	var cur []chipItem
-	used := 2 // 左侧留白
-	flush := func() {
-		if len(cur) == 0 {
-			return
-		}
-		batch := append([]chipItem{}, cur...)
-		rows = append(rows, func(c *canvas, l *lineBuilder, y, x int) {
-			l.styled("", " ")
-			cx := x + 1
-			for _, it := range batch {
-				cx = c.chip(l, y, cx, it.action, it.label, it.selected)
-			}
-		})
-		cur, used = nil, 2
-	}
-	for _, it := range items {
-		wid := chipWidth(it)
-		if len(cur) > 0 && used+wid > w {
-			flush()
-		}
-		cur = append(cur, it)
-		used += wid
-	}
-	flush()
-	return rows
-}
-
-func chipWidth(it chipItem) int {
-	text := "  " + it.label + "  "
-	if it.selected {
-		text = "● " + it.label + " "
-	}
-	return dispWidth(text) + 2
 }
 
 // ---------------------------------------------------------------------------
@@ -1517,7 +1023,7 @@ func renderFooter(c *canvas, st *state) {
 					style = cBad
 				}
 			}
-			l.styled(style, " "+truncDisplay(st.status, c.w-3))
+			l.styled(style, " "+truncDisplay(oneLine(st.status), c.w-3))
 			l.pad(c.w - 1)
 			l.styled(cBorder, "│")
 		})
@@ -1534,50 +1040,56 @@ func renderFooter(c *canvas, st *state) {
 		return
 	}
 
-	c.row(func(l *lineBuilder, y int) {
-		l.styled(cBorder, "│")
-		prompt := promptFor(st)
-		avail := c.w - 2 - dispWidth(prompt)
-		if avail < 1 {
-			avail = 1
-		}
-		from, widths, _ := inputWindow(st, avail)
-		l.styled(promptStyle(st), prompt)
-		used := 0
-		for i := from; i < len(st.input); i++ {
-			if used+widths[i] > avail {
-				break
+	box := buildInputBox(st, c.w, c.h)
+	for k := 0; k < box.rows; k++ {
+		idx := box.view.from + k
+		first := k == 0
+		c.row(func(l *lineBuilder, y int) {
+			l.styled(cBorder, "│")
+			if first {
+				l.styled(promptStyle(st), box.prompt)
+			} else {
+				// 续行只留出提示符的宽度：文字仍然对齐在同一列上
+				l.styled("", strings.Repeat(" ", box.promptW))
 			}
-			l.styled("", string(st.input[i]))
-			used += widths[i]
-		}
 
-		// 附件按钮贴在输入行右侧：只在剩下的宽度够放时才画，
-		// 免得把用户正在打的字挤掉（那比没有按钮更烦人）。
-		btnText := "附件"
-		if n := len(st.attachments); n > 0 {
-			btnText = fmt.Sprintf("附件 %d", n)
-		}
-		btnW := dispWidth(btnText) + 4
-		btnX := -1
-		if c.w-2-used >= btnW+2 {
-			btnX = c.w - 2 - btnW
-			_ = c.button(l, y, btnX, "btn:attach", btnText, true)
-		}
+			used := 0
+			if idx < len(box.view.lines) {
+				base := box.view.starts[idx]
+				for i, r := range box.view.lines[idx] {
+					if used+runeWidth(r) > box.textW {
+						break
+					}
+					style := ""
+					if st.selOn {
+						// 选中段的字符反白：鼠标拖出来的选择，肉眼要看得见边界
+						if ii := base + i; ii >= st.selA && ii < st.selB {
+							style = cSelBG + cBold
+						}
+					}
+					l.styled(style, string(r))
+					used += runeWidth(r)
+				}
+			}
 
-		// 输入区的焦点框必须避开按钮：hit 返回的是**第一个**命中的热区，
-		// 焦点框若盖住按钮，用户点「附件」会变成点输入框 —— 点不动。
-		focusX := 1 + dispWidth(prompt)
-		focusW := avail
-		if btnX >= 0 {
-			focusW = btnX - 1 - focusX
-		}
-		if focusW > 0 {
-			c.box("focus:chat", focusX, y, focusW)
-		}
-		l.pad(c.w - 1)
-		l.styled(cBorder, "│")
-	})
+			// 按钮只画在第一条可见行上。它们的宽度已经在折行时预留过，
+			// 所以文字不可能顶到下面把它们盖住 —— 热区可见即可点。
+			if first && box.btns.ok {
+				cx := c.button(l, y, box.btns.attX, "btn:attach", box.btns.attTxt, true)
+				_ = c.button(l, y, cx, "btn:send", box.btns.sendTxt, true)
+			}
+
+			// 每条可见行都登记输入区热区：点第几列就把光标放到第几列（tui.go 的 caret），
+			// 拖过文字会选中。右边界正好停在按钮左侧，不会抢走按钮的点击。
+			for col := 0; col < box.textW; col++ {
+				c.box(fmt.Sprintf("caret:chat:%d", col), 1+box.promptW+col, y, 1)
+			}
+			// 提示符与行尾空白也归输入框：点它们聚焦即可，不挪光标
+			c.box("focus:chat", 1, y, c.w-2)
+			l.pad(c.w - 1)
+			l.styled(cBorder, "│")
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,46 +1230,206 @@ func renderShareBar(c *canvas, st *state) {
 	})
 }
 
-// inputWindow 计算输入行的显示窗口：返回起始 rune 下标与每字符宽度。
-func inputWindow(st *state, avail int) (from int, widths []int, cursorW int) {
-	widths = make([]int, len(st.input))
-	for i, r := range st.input {
-		widths[i] = runeWidth(r)
-		if i < st.cursor {
-			cursorW += runeWidth(r)
-		}
-	}
-	if avail < 1 {
-		avail = 1
-	}
-	if cursorW < avail {
-		return 0, widths, cursorW
-	}
-	target := cursorW - avail*3/4
-	acc := 0
-	for i := 0; i < len(st.input); i++ {
-		if acc >= target {
-			return i, widths, cursorW
-		}
-		acc += widths[i]
-	}
-	return len(st.input), widths, cursorW
+// ---------------------------------------------------------------------------
+// 输入区（多行）
+// ---------------------------------------------------------------------------
+
+// maxInputRows 是输入框长到几行就不再长。
+//
+// 这是"写一条消息"的地方，不是写文档的地方；再长就会把上面的对话挤没。
+// 超出的部分靠滚动看，而滚动窗口始终跟着光标走。
+const maxInputRows = 6
+
+// bodyMinH 是聊天区至少要留下的行数：输入框最多只长到不挤垮它。
+const bodyMinH = 3
+
+// inputMinTextW 是输入框里至少要给文字留的宽度。
+// 留不够就宁可不画按钮（窄屏上文字比按钮重要），发送靠 Ctrl+Enter。
+const inputMinTextW = 12
+
+// inputView 是把输入内容折行之后的结果。
+//
+// 折行只为了**显示**：st.input 里真正的换行符只有用户按回车插进去的那些。
+// 所以窗口变窄不会改变消息内容 —— 软折出来的换行绝不会被当成内容发出去。
+type inputView struct {
+	lines  [][]rune // 折好的显示行（不含换行符）
+	starts []int    // 每行第一个 rune 在 st.input 里的下标
+	rows   int      // 显示行总数
+	from   int      // 第一条可见行（滚动窗口）
+	cur    int      // 光标所在显示行
+	col    int      // 光标在该行内的显示列（0 基）
 }
 
-// cursorPos 返回光标在输入行内的列偏移（0 基）。
-func cursorPos(st *state, w int) int {
-	prompt := promptFor(st)
-	avail := w - 2 - dispWidth(prompt)
-	from, widths, _ := inputWindow(st, avail)
+// visibleRows 是这块输入实际占屏幕几行。
+func (iv inputView) visibleRows() int {
+	if iv.rows > maxInputRows {
+		return maxInputRows
+	}
+	if iv.rows < 1 {
+		return 1
+	}
+	return iv.rows
+}
 
-	col := dispWidth(prompt) + 1
-	for i := from; i < st.cursor && i < len(st.input); i++ {
-		col += widths[i]
+// indexAt 返回"第 line 行、显示列不超过 col"处的 rune 下标。
+// col 超过该行长度就落到行尾 —— ↑↓ 和 Home/End 都靠它换算光标。
+func (iv inputView) indexAt(line, col int) int {
+	if line < 0 || line >= len(iv.lines) {
+		return iv.starts[len(iv.starts)-1]
 	}
-	if col > w-2 {
-		col = w - 2
+	acc := 0
+	for i, r := range iv.lines[line] {
+		if acc >= col {
+			return iv.starts[line] + i
+		}
+		acc += runeWidth(r)
 	}
-	return col
+	return iv.starts[line] + len(iv.lines[line])
+}
+
+// buildInputView 把输入内容按可用宽度折成显示行，并标出光标在哪一行哪一列。
+func buildInputView(st *state, width int) inputView {
+	if width < 1 {
+		width = 1
+	}
+	iv := inputView{lines: [][]rune{{}}, starts: []int{0}}
+	line, w := 0, 0
+	newline := func() {
+		line++
+		w = 0
+		iv.lines = append(iv.lines, []rune{})
+		iv.starts = append(iv.starts, 0) // 行首下标由调用处补上，两者必须同步增长
+	}
+	place := func(r rune) {
+		if w+runeWidth(r) > width && w > 0 {
+			newline()
+		}
+		iv.lines[line] = append(iv.lines[line], r)
+		w += runeWidth(r)
+	}
+	for i, r := range st.input {
+		if i == st.cursor {
+			iv.cur, iv.col = line, w
+		}
+		if r == '\n' {
+			newline()
+			iv.starts[line] = i + 1
+			continue
+		}
+		before := line
+		place(r)
+		if line != before {
+			// 软折产生的新行：它的第一个字符就是当前这个 r
+			iv.starts[line] = i
+		}
+	}
+	if st.cursor >= len(st.input) {
+		iv.cur, iv.col = line, w // 光标在末尾（打字的位置）
+	}
+	iv.rows = len(iv.lines)
+
+	// 滚动窗口跟着光标走：可见行里看不到光标就把它带进来
+	if v := iv.visibleRows(); iv.cur >= iv.from+v {
+		iv.from = iv.cur - v + 1
+	}
+	return iv
+}
+
+// inputButtons 是输入行右侧那两个按钮的位置与文字。
+type inputButtons struct {
+	ok      bool // 这一屏画不画按钮
+	resv    int  // 按钮一共占掉多少列（含与文字之间的那 1 列空隙）
+	attX    int
+	attTxt  string
+	sendX   int
+	sendTxt string
+}
+
+// inputButtonsFor 决定右侧按钮放哪、给文字留多宽。
+//
+// 按钮宽度必须从文字的折行宽度里**预先扣掉**：不扣的话第一行文字会顶到按钮下面
+// 把它们盖住 —— 热区还在，但用户看不见，也就点不到「发送」。而「发送」是现在
+// 唯一无歧义的送出口，不能时有时无。
+func inputButtonsFor(st *state, w int) (inputButtons, int) {
+	var b inputButtons
+	b.attTxt = "附件"
+	if n := len(st.attachments); n > 0 {
+		b.attTxt = fmt.Sprintf("附件 %d", n)
+	}
+	b.sendTxt = "发送"
+	if st.editing != "" {
+		b.sendTxt = "提交" // 修改态：这个按钮是把这条消息存成一个新版本
+	}
+
+	full := w - 2 - dispWidth(promptFor(st))
+	// button 画的其实是 " label "，比 label 宽 2 列；两个按钮之间再隔 2 列。
+	b.sendX = w - dispWidth(b.sendTxt) - 4
+	b.attX = b.sendX - dispWidth(b.attTxt) - 4
+	b.resv = w - b.attX // 一直到右边界都归按钮（含与文字之间的那 1 列空隙）
+
+	if full-b.resv < inputMinTextW {
+		return b, full // 窄屏：不画按钮，文字优先
+	}
+	b.ok = true
+	return b, full - b.resv
+}
+
+// inputBox 是输入区这一帧的完整测算结果。
+type inputBox struct {
+	prompt  string
+	promptW int
+	textW   int // 文字可用宽度（折行就按它算）
+	btns    inputButtons
+	view    inputView
+	rows    int // 实际占屏幕几行
+}
+
+// buildInputBox 把横向分配、折行结果与占用行数一次算清。
+//
+// renderFrame（给版面让位）、renderFooter（画）、cursorSeq（摆光标）三处都必须用
+// 同一份结果：各算一份的话，光标就会摆到别的行上去 —— 而偏了看起来就是"输入框坏了"。
+func buildInputBox(st *state, w, h int) inputBox {
+	box := inputBox{prompt: promptFor(st)}
+	box.promptW = dispWidth(box.prompt)
+	if box.promptW < 0 {
+		box.promptW = 0
+	}
+
+	// 非聊天页、或面板占着聊天区时，这里只是一行普通状态栏
+	if st.tab != tabChat || st.shareOpen || st.attachOpen {
+		box.textW = maxInt(1, w-2-box.promptW)
+		box.rows = 1
+		return box
+	}
+
+	textW := w - 2 - box.promptW
+	box.btns, textW = inputButtonsFor(st, w)
+	box.textW = maxInt(1, textW)
+	box.view = buildInputView(st, box.textW)
+
+	rows := box.view.visibleRows()
+	if limit := h - 4 - bodyMinH; rows > limit {
+		rows = limit
+	}
+	box.rows = maxInt(1, rows)
+	return box
+}
+
+// cursorCol 返回光标在屏幕上的列（1 基）。
+func (b inputBox) cursorCol() int {
+	// 第 1 列是边框，接着是提示符，再往后才是文字
+	return b.promptW + b.view.col + 2
+}
+
+// cursorRow 返回光标在屏幕上的行（1 基）。输入区占的是最下面那几行。
+func (b inputBox) cursorRow(h int) int {
+	return h - b.rows + (b.view.cur - b.view.from)
+}
+
+// cursorPos 返回光标在输入行内的列偏移（0 基）。单测用它比较左右移动的位移。
+func cursorPos(st *state, w int) int {
+	box := buildInputBox(st, w, maxInt(1, st.h))
+	return box.promptW + 1 + box.view.col
 }
 
 // ---------------------------------------------------------------------------

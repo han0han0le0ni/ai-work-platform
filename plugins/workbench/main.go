@@ -4,7 +4,9 @@
 //
 //   - 聊天页：消息区 + 可点击的服务清单（点一个服务就跳到它的插件详情）
 //   - 插件页：列出所有已安装插件（读 plugins/*/manifest.json），点开看服务/权限/依赖
-//   - 设置页：点选 provider、填入 API Key，保存即生效
+//   - 设置页：接入模型分「云端 / 本地」两条路 ——
+//     云端＝知名平台快捷连接 + 自定义/冷门平台；本地＝扫描本机 AI + 已知应用 + 手动填。
+//     挑完服务，右边填密钥、模型、地址，保存即生效。
 //
 // 硬通道约束不变：插件的 stdin/stdout 是 JSON-RPC，界面直接渲染控制终端。
 // 鼠标按平台各走一条路：
@@ -50,12 +52,6 @@ var probeList = []string{
 // disabledSuffix 与 plugin-manager 保持一致：目录加了这个后缀，核心就不再加载它。
 const disabledSuffix = ".disabled"
 
-// managerPluginID 是插件管理器的 ID。
-//
-// 界面上的启停 / 删除都要经过它，所以它和界面自己一样受保护：
-// 删掉或禁用它，界面就再也没法管理插件了。
-const managerPluginID = "com.official.plugin-manager"
-
 // Workbench 实现 plugin.Plugin，同时是界面的 backend。
 type Workbench struct {
 	ctx *plugin.Context
@@ -78,11 +74,7 @@ func (w *Workbench) Activate(ctx *plugin.Context) error {
 		return nil
 	}
 
-	// 订阅里有一半是为了「看见 AI 在干什么」：agent.think / chat.tool.*
-	// 把编排过程一条条抛到总线上，界面攒起来就是那个过程框（见 activity.go）。
-	watched := []string{"plugin.state", "chat.message", "chat.response", "core.log", "usage.snapshot"}
-	watched = append(watched, agentEvents...)
-	for _, name := range watched {
+	for _, name := range watchedEvents() {
 		event := name
 		ctx.On(event, func(payload json.RawMessage) { w.onEvent(event, payload) })
 	}
@@ -123,15 +115,12 @@ func (w *Workbench) Activate(ctx *plugin.Context) error {
 		_ = ctx.Emit("ui.overlay.claim", map[string]any{"by": ctx.PluginID})
 	})
 
-	// 浮窗位置是用户拖出来的，得记住：读回上次停在哪儿
-	var fc floatCfg
-	if raw, err := ctx.GetConfig("float"); err == nil && len(raw) > 0 {
-		_ = json.Unmarshal(raw, &fc)
-	}
+	// 浮窗位置是用户拖出来的，得记住。保存回调注入到界面（落盘丢后台），
+	// 读取在浮窗清单回来时按每个浮窗的 svc/id 去查（见 applyWidgets）。
 	a.post(func() {
-		a.st.floatX, a.st.floatY, a.st.floatFold = fc.X, fc.Y, fc.Fold
-		// 界面线程不做 RPC，落盘丢到后台
-		a.st.floatSave = func(x, y int, fold bool) { go w.saveFloat(x, y, fold) }
+		a.st.widgetSave = func(svc, id string, x, y int, fold bool) {
+			go w.saveWidget(svc, id, x, y, fold)
+		}
 	})
 
 	ctx.Log("info", "工作台已就绪（可点击）", map[string]any{"permissions": ctx.Permissions})
@@ -150,6 +139,24 @@ func (w *Workbench) Activate(ctx *plugin.Context) error {
 // core.on，于是所有插件的回调都是死的），二是即使收到了 plugin.state，也只把它
 // 记进侧栏的事件列表、不刷新快照。两个都修掉之后，排在界面之后激活的插件
 // （workspace.plugin 的 works 在 workbench 的 workb 之后）才不会永久显示成「未运行」。
+// watchedEvents 是界面订阅的事件清单。
+//
+// 订阅里有一半是为了「看见 AI 在干什么」：agent.think / chat.tool.*
+// 把编排过程一条条抛到总线上，界面攒起来就是那个过程框（见 activity.go）。
+//
+// 另一小半是"平台本身在动"：插件起来 / 挂掉 / **被删掉**都得重扫一遍快照，
+// 否则界面停在旧事实上。plugin.deleted 尤其不能漏 —— 漏了它，被删插件
+// 提供的那一页（ui.page.*）会永远留在标签栏上，点进去只剩一句"插件不在了"。
+func watchedEvents() []string {
+	out := []string{
+		"plugin.state", "plugin.deleted",
+		"chat.message", "chat.response", "core.log",
+	}
+	// 插件自带页面 / 浮窗靠事件喊"我变了"：界面据此重新去要一帧。
+	out = append(out, pageChangedEvent, widgetChangedEvent)
+	return append(out, agentEvents...)
+}
+
 func (w *Workbench) onEvent(name string, payload json.RawMessage) {
 	a := w.currentApp()
 	if a == nil {
@@ -159,15 +166,37 @@ func (w *Workbench) onEvent(name string, payload json.RawMessage) {
 		w.pushEvent(name, summarize(payload))
 		// agent 那几个事件额外并进「AI 在干什么」的过程框
 		w.applyTrace(a, name, payload)
-		if name == "usage.snapshot" {
-			w.applyUsage(a, payload)
-		}
 	})
 
-	if name == "plugin.state" {
+	if name == "plugin.deleted" {
+		// 删除是"重启生效"的：正在运行的插件目录被占用、删不掉，只是标了
+		// "待重启删除"，目录此刻还在 —— 光重扫没用，扫描还是会看到它。
+		// 所以除了重扫，还要**立刻**把它的页面下线，并记住"它被删了"，
+		// 之后每一轮扫描结果都把它滤掉。
+		var del struct {
+			PluginID string `json:"pluginId"`
+			Dir      string `json:"dir"`
+		}
+		_ = json.Unmarshal(payload, &del)
+		a.post(func() { a.dropPlugin(del.PluginID, del.Dir) })
+		a.scheduleRescan()
+	} else if name == "plugin.state" {
 		// 插件是逐个激活的，界面自己也在队列里。有插件动了就补扫一次快照，
 		// 免得把「稍后才注册」的服务一直显示成未安装。
 		a.scheduleRescan()
+	}
+
+	// 某个插件的页面说自己变了：把那一页的缓存作废，下一帧自然会重新去要。
+	// 少了这一步，页面就会停在旧内容上 —— 看起来就是"点了没反应"。
+	if name == pageChangedEvent {
+		svc, id := pageChangedRef(payload)
+		a.post(func() { a.invalidatePage(svc, id) })
+	}
+
+	// 某个浮窗说自己变了：重新要一帧内容。
+	if name == widgetChangedEvent {
+		svc, id := widgetChangedRef(payload)
+		a.post(func() { a.invalidateWidget(svc, id) })
 	}
 }
 
@@ -308,11 +337,9 @@ func (w *Workbench) scanPlugins() ([]pluginInfo, error) {
 func (w *Workbench) readPlugin(dir string) pluginInfo {
 	base := strings.TrimSuffix(dir, disabledSuffix)
 	info := pluginInfo{
-		ID:       strings.TrimSuffix(base, ".plugin"),
-		Dir:      dir,
-		Disabled: dir != base,
+		ID:  strings.TrimSuffix(base, ".plugin"),
+		Dir: dir,
 	}
-	info.Self = info.ID == w.ctx.PluginID || info.ID == managerPluginID
 
 	raw, err := w.ctx.FSRead("plugins/" + dir + "/manifest.json")
 	if err != nil {
@@ -327,21 +354,11 @@ func (w *Workbench) readPlugin(dir string) pluginInfo {
 		return info
 	}
 
+	// 只取两样用得上的：id（认归属）与 provides（认 ui.page.*、说清谁提供服务）。
+	// 其余字段（名字、版本、简介、依赖、权限…）都随插件页搬去了 pluginManager。
 	var m struct {
-		ID           string            `json:"id"`
-		Name         string            `json:"name"`
-		Description  string            `json:"description"`
-		Version      string            `json:"version"`
-		APIVersion   string            `json:"apiVersion"`
-		Entry        string            `json:"entry"`
-		Runtime      string            `json:"runtime"`
-		Dependencies map[string]string `json:"dependencies"`
-		Provides     []string          `json:"provides"`
-		Consumes     []string          `json:"consumes"`
-		Permissions  []string          `json:"permissions"`
-		Compat       struct {
-			Core string `json:"core"`
-		} `json:"compat"`
+		ID       string   `json:"id"`
+		Provides []string `json:"provides"`
 	}
 	if err := json.Unmarshal([]byte(file.Content), &m); err != nil {
 		info.ReadErr = "manifest.json 非法: " + err.Error()
@@ -349,232 +366,15 @@ func (w *Workbench) readPlugin(dir string) pluginInfo {
 	}
 
 	info.ID = firstNonEmpty(m.ID, info.ID)
-	info.Name = m.Name
-	info.Description = m.Description
-	info.Version = m.Version
-	info.Runtime = m.Runtime
-	info.Entry = m.Entry
 	info.Provides = m.Provides
-	info.Consumes = m.Consumes
-	info.Permissions = m.Permissions
-	info.Compat = m.Compat.Core
-	for dep, rng := range m.Dependencies {
-		info.Deps = append(info.Deps, dep+" "+rng)
-	}
-	sort.Strings(info.Deps)
 
 	// 声明的服务到底是谁在提供：只有真正登记在那个插件名下的才算"运行中"
 	for _, svc := range m.Provides {
 		if pid, err := w.ctx.Consume(svc); err == nil && pid == info.ID {
 			info.Alive = append(info.Alive, svc)
-		} else {
-			info.Dead = append(info.Dead, svc)
 		}
 	}
 	return info
-}
-
-func (w *Workbench) loadLLM() (llmConfig, error) {
-	var cfg llmConfig
-	if _, err := w.ctx.Consume("llm.v1"); err != nil {
-		return cfg, fmt.Errorf("llm.v1 不可用（%s）", reasonOf(err))
-	}
-	raw, err := w.ctx.Invoke("llm.v1", "providers", map[string]any{})
-	if err != nil {
-		return cfg, err
-	}
-	var out struct {
-		Current string `json:"current"`
-		Config  struct {
-			Provider    string `json:"provider"`
-			BaseURL     string `json:"baseUrl"`
-			Model       string `json:"model"`
-			APIKey      string `json:"apiKey"`
-			VisionModel string `json:"visionModel"`
-		} `json:"config"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return cfg, fmt.Errorf("解析 llm.v1 响应失败: %w", err)
-	}
-	cfg.Provider = firstNonEmpty(out.Config.Provider, out.Current)
-	cfg.BaseURL = out.Config.BaseURL
-	cfg.Model = out.Config.Model
-	cfg.APIKey = out.Config.APIKey // 已经是打码值
-	cfg.VisionModel = out.Config.VisionModel
-	return cfg, nil
-}
-
-// saveLLM 只提交界面里真正填过的字段：留空表示"不改动"，所以不会把已有密钥抹掉。
-// 想主动清空密钥，在 API Key 里输入一个减号。
-func (w *Workbench) saveLLM(provider, baseURL, model, apiKey, visionModel string) (string, error) {
-	if _, err := w.ctx.Consume("llm.v1"); err != nil {
-		return "llm.v1 不可用（" + reasonOf(err) + "）", err
-	}
-
-	params := map[string]any{}
-	if s := strings.TrimSpace(provider); s != "" {
-		params["provider"] = s
-	}
-	if s := strings.TrimSpace(baseURL); s != "" {
-		params["baseUrl"] = s
-	}
-	if s := strings.TrimSpace(model); s != "" {
-		params["model"] = s
-	}
-	switch s := strings.TrimSpace(apiKey); s {
-	case "":
-		// 不改动
-	case "-":
-		params["apiKey"] = ""
-	default:
-		params["apiKey"] = s
-	}
-	// 识图模型：语义与密钥一致（留空=不改动，减号=清空），
-	// 否则用户每次只是想改主模型，都会被顺手清掉视觉配置。
-	switch s := strings.TrimSpace(visionModel); s {
-	case "":
-		// 不改动
-	case "-":
-		params["visionModel"] = ""
-	default:
-		params["visionModel"] = s
-	}
-	if len(params) == 0 {
-		return "没有可保存的改动", fmt.Errorf("没有可保存的改动")
-	}
-
-	raw, err := w.ctx.Invoke("llm.v1", "configure", params)
-	if err != nil {
-		return "保存失败：" + err.Error(), err
-	}
-	var out struct {
-		Updated int `json:"updated"`
-	}
-	_ = json.Unmarshal(raw, &out)
-
-	// 写入了密钥就明说一句（打码），否则用户看到一个空输入框会以为没存上
-	note := fmt.Sprintf("已保存 %d 项配置，立即生效（不需要重启）", out.Updated)
-	if s := strings.TrimSpace(apiKey); s != "" && s != "-" {
-		note = fmt.Sprintf("已保存 %d 项配置 · 密钥 %s 已写入，界面不再显示明文",
-			out.Updated, maskForDisplay(s))
-	}
-	return note, nil
-}
-
-// testLLM 发一次极小的真实请求：这是唯一能确认"密钥和地址真的能用"的办法。
-func (w *Workbench) testLLM() (string, error) {
-	if _, err := w.ctx.Consume("llm.v1"); err != nil {
-		return "llm.v1 不可用（" + reasonOf(err) + "）", err
-	}
-	start := time.Now()
-	raw, err := w.ctx.Invoke("llm.v1", "chat", map[string]any{
-		"messages":  []map[string]string{{"role": "user", "content": "回复 ok 两个字即可"}},
-		"maxTokens": 16,
-	})
-	if err != nil {
-		return "连接失败：" + err.Error(), err
-	}
-	var out struct {
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
-		Content  string `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "解析响应失败：" + err.Error(), err
-	}
-	reply := strings.TrimSpace(out.Content)
-	if rs := []rune(reply); len(rs) > 60 {
-		reply = string(rs[:60]) + "…"
-	}
-	return fmt.Sprintf("连接正常（%s / %s，%dms）：%s",
-		out.Provider, out.Model, time.Since(start).Milliseconds(), reply), nil
-}
-
-// listModels 让 llm.v1 去服务端要一份真实的模型清单。
-//
-// 用它而不是在界面里硬编码模型名：模型迭代太快，写死的清单很快就会过期。
-func (w *Workbench) listModels(provider, baseURL, apiKey string) ([]string, string, error) {
-	if _, err := w.ctx.Consume("llm.v1"); err != nil {
-		return nil, "llm.v1 不可用（" + reasonOf(err) + "）", err
-	}
-	params := map[string]any{}
-	if s := strings.TrimSpace(provider); s != "" {
-		params["provider"] = s
-	}
-	if s := strings.TrimSpace(baseURL); s != "" {
-		params["baseUrl"] = s
-	}
-	if s := strings.TrimSpace(apiKey); s != "" {
-		params["apiKey"] = s
-	}
-
-	raw, err := w.ctx.Invoke("llm.v1", "models", params)
-	if err != nil {
-		return nil, "获取模型失败：" + err.Error(), err
-	}
-	var out struct {
-		Models []string `json:"models"`
-		Note   string   `json:"note"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return nil, "解析模型列表失败：" + err.Error(), err
-	}
-	note := fmt.Sprintf("已获取 %d 个可用模型，点一个即可", len(out.Models))
-	if out.Note != "" {
-		note = out.Note
-	}
-	return out.Models, note, nil
-}
-
-// setPluginEnabled 经 pluginManager.v1 启停插件。
-//
-// 界面自己只有 filesystem:read —— 它没资格改任何文件。真正动目录的是插件管理器，
-// 界面只是把意图传过去。这是能力代理该有的样子。
-func (w *Workbench) setPluginEnabled(id, dir string, enabled bool) (string, error) {
-	if _, err := w.ctx.Consume("pluginManager.v1"); err != nil {
-		return "未安装插件管理器（pluginManager.v1），无法启停", err
-	}
-	raw, err := w.ctx.Invoke("pluginManager.v1", "setEnabled", map[string]any{
-		"id": id, "dir": dir, "enabled": enabled,
-	})
-	if err != nil {
-		return "操作失败：" + err.Error(), err
-	}
-	var out struct {
-		Note string `json:"note"`
-		Dir  string `json:"dir"`
-	}
-	_ = json.Unmarshal(raw, &out)
-	note := firstNonEmpty(out.Note, "已更新")
-	if out.Dir != "" {
-		note += "（" + out.Dir + "）"
-	}
-	// 正在运行的插件目录被占用，改不动名 —— 已记为待重启变更，说人话
-	if strings.Contains(note, "下次启动时生效") {
-		return note + "。它现在还在运行，重启后才真正" + map[bool]string{true: "启用", false: "停用"}[enabled], nil
-	}
-	return note, nil
-}
-
-// deletePlugin 经 pluginManager.v1 删除插件。
-func (w *Workbench) deletePlugin(id, dir string) (string, error) {
-	if _, err := w.ctx.Consume("pluginManager.v1"); err != nil {
-		return "未安装插件管理器（pluginManager.v1），无法删除", err
-	}
-	raw, err := w.ctx.Invoke("pluginManager.v1", "delete", map[string]any{"id": id, "dir": dir})
-	if err != nil {
-		return "删除失败：" + err.Error(), err
-	}
-	var out struct {
-		Status string `json:"status"`
-		Note   string `json:"note"`
-	}
-	_ = json.Unmarshal(raw, &out)
-	// 正在运行的插件当场删不掉，是预期情况，说人话而不是抛错误
-	if out.Status == "deferred" {
-		return "已标记删除：它还在运行，重启时核心会在加载插件前清干净", nil
-	}
-	return firstNonEmpty(out.Note, "已删除"), nil
 }
 
 // wsBrowse 列出目录，供文件页挑工作区。
@@ -601,33 +401,143 @@ func (w *Workbench) wsBrowse(path string) (wsListing, error) {
 	return ls, nil
 }
 
-// wsSetRoot 把工作区设成指定目录，并顺手回读一次列表。
-func (w *Workbench) wsSetRoot(path string) (wsListing, error) {
-	if _, err := w.ctx.Consume("workspace.v1"); err != nil {
-		return wsListing{}, fmt.Errorf("未安装工作区插件（workspace.v1），无法设置工作区")
-	}
-	if strings.TrimSpace(path) == "" {
-		return wsListing{}, fmt.Errorf("请先填写或挑一个目录")
-	}
-	raw, err := w.ctx.Invoke("workspace.v1", "setRoot", map[string]any{"path": path})
+// ---------------------------------------------------------------------------
+// 插件自带的页面（ui.page.*）
+//
+// 界面不实现任何页面，只做四件事：问清单、要一帧、把点击转过去、把按键转过去。
+// 装一个带界面的插件就多一页，这个文件不用改 —— 这才是"万物皆插件"。
+// ---------------------------------------------------------------------------
+
+// widgetList 问一个服务有哪些浮窗。
+func (w *Workbench) widgetList(svc string) ([]plugin.WidgetInfo, error) {
+	raw, err := w.ctx.Invoke(svc, "list", map[string]any{})
 	if err != nil {
-		return wsListing{}, err
+		return nil, err
 	}
 	var out struct {
-		Root string `json:"root"`
+		Widgets []plugin.WidgetInfo `json:"widgets"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return wsListing{}, fmt.Errorf("解析响应失败: %w", err)
+		return nil, fmt.Errorf("解析浮窗清单失败: %w", err)
 	}
+	return out.Widgets, nil
+}
 
-	ls, err := w.wsBrowse(out.Root)
+// widgetRender 问插件要浮窗的展开态内容。
+func (w *Workbench) widgetRender(svc, id string) (plugin.WidgetRender, error) {
+	var out plugin.WidgetRender
+	raw, err := w.ctx.Invoke(svc, "render", map[string]any{"id": id})
 	if err != nil {
-		// 工作区已经设上了，只是列表没读到：把根目录照实报出来
-		return wsListing{Root: out.Root, Note: "工作区已设为 " + out.Root}, nil
+		return out, err
 	}
-	ls.Root = out.Root
-	ls.Note = "工作区已设为 " + out.Root + "（重启后仍记得）"
-	return ls, nil
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("解析浮窗帧失败: %w", err)
+	}
+	return out, nil
+}
+
+// pageList 问一遍这些服务各自提供哪些页面。
+//
+// services 由界面从扫描到的 manifest 里挑出来（见 pageServices）：插件是逐个
+// 启动的，靠广播互相发现要看运气，而 manifest 一向扫得到。
+func (w *Workbench) pageList(services []string) ([]pagePanel, error) {
+	var out []pagePanel
+	for _, svc := range services {
+		if _, err := w.ctx.Consume(svc); err != nil {
+			// 声明了却没跑起来（被跳过 / 崩了）：跳过它，别让一页拖垮整张清单
+			continue
+		}
+		raw, err := w.ctx.Invoke(svc, "list", map[string]any{})
+		if err != nil {
+			w.ctx.Log("warn", "问页面清单失败（"+svc+"）："+err.Error(), nil)
+			continue
+		}
+		var got struct {
+			Panels []plugin.PanelInfo `json:"panels"`
+		}
+		if err := json.Unmarshal(raw, &got); err != nil {
+			w.ctx.Log("warn", "解析页面清单失败（"+svc+"）："+err.Error(), nil)
+			continue
+		}
+		for _, p := range got.Panels {
+			if strings.TrimSpace(p.ID) == "" {
+				continue
+			}
+			out = append(out, pagePanel{svc: svc, id: p.ID, title: p.Title, order: p.Order})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].order != out[j].order {
+			return out[i].order < out[j].order
+		}
+		return out[i].ref() < out[j].ref()
+	})
+	return out, nil
+}
+
+// pageRender 找插件要一帧。
+//
+// 刻意不先 Consume 一次：这里就在打字与滚动的路径上，多一次往返就是多一截
+// 打字延迟。插件真的不在了，Invoke 自己会返回"提供者已死"。
+func (w *Workbench) pageRender(svc, id string, width, height, scroll int) (plugin.PanelRender, error) {
+	var out plugin.PanelRender
+	raw, err := w.ctx.Invoke(svc, "render", map[string]any{
+		"panel": id, "w": width, "h": height, "scroll": scroll,
+	})
+	if err != nil {
+		return out, err
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("解析页面帧失败: %w", err)
+	}
+	return out, nil
+}
+
+// pageAction 把面板里的一次点击转给插件，返回它想显示的那句话。
+func (w *Workbench) pageAction(svc, id, action, arg string) (string, error) {
+	raw, err := w.ctx.Invoke(svc, "action", map[string]any{
+		"panel": id, "action": action, "arg": arg,
+	})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Note string `json:"note"`
+	}
+	_ = json.Unmarshal(raw, &out)
+	return out.Note, nil
+}
+
+// pageKey 把一次按键转给插件，带回插件对这次按键的回应（见 pageKeyResult）。
+//
+// 用 Invoke 而不是单向通知：SDK 没有"发完不等"的调用，而按键必须**按顺序**
+// 抵达插件（乱序打字就是乱码）—— 顺序由界面侧的一条队列保证（见 startPageKeys）。
+func (w *Workbench) pageKey(svc, id, kind, text string) (pageKeyResult, error) {
+	raw, err := w.ctx.Invoke(svc, "key", map[string]any{
+		"panel": id, "kind": kind, "text": text,
+	})
+	if err != nil {
+		return pageKeyResult{}, err
+	}
+	var out struct {
+		Copy string `json:"copy,omitempty"` // 请宿主把这段文字写进剪贴板
+		Exit bool   `json:"exit,omitempty"` // 请宿主退出（Ctrl+C 且没选中）
+	}
+	_ = json.Unmarshal(raw, &out)
+	return pageKeyResult{copyText: out.Copy, exit: out.Exit}, nil
+}
+
+// pageChangedRef 从事件载荷里取出"哪一页变了"。
+//
+// 插件报服务名最好（精确到某个插件的某一页）；只报页面 id 也能用 ——
+// 名字撞车时最多多刷一页，不会刷错东西。
+func pageChangedRef(payload json.RawMessage) (svc, id string) {
+	var in struct {
+		Service string `json:"service"`
+		Panel   string `json:"panel"`
+	}
+	_ = json.Unmarshal(payload, &in)
+	return in.Service, in.Panel
 }
 
 // ---------------------------------------------------------------------------
@@ -977,20 +887,34 @@ func parseConv(raw json.RawMessage) (convSnapshot, error) {
 	return s, nil
 }
 
-// floatCfg 是浮窗位置在配置里的样子（见 float.go）。
-type floatCfg struct {
-	X    int  `json:"x"`
-	Y    int  `json:"y"`
-	Fold bool `json:"fold"`
+// widgetPos 读某个浮窗上次停下的位置；没读过返回 (0,0,false)（界面会贴右上角）。
+func (w *Workbench) widgetPos(svc, id string) (int, int, bool) {
+	raw, err := w.ctx.GetConfig("widget:" + svc + "/" + id)
+	if err != nil || len(raw) == 0 {
+		return 0, 0, false
+	}
+	var v struct {
+		X    int  `json:"x"`
+		Y    int  `json:"y"`
+		Fold bool `json:"fold"`
+	}
+	if json.Unmarshal(raw, &v) != nil {
+		return 0, 0, false
+	}
+	return v.X, v.Y, v.Fold
 }
 
-// saveFloat 把浮窗停下的地方写回配置：下次启动还在那儿。
-func (w *Workbench) saveFloat(x, y int, fold bool) {
-	raw, err := json.Marshal(floatCfg{X: x, Y: y, Fold: fold})
+// saveWidget 把某个浮窗停下的地方写回配置：下次启动还在那儿。
+//
+// 每个浮窗一个键（widget:<服务>/<id>）：位置是界面的 UI 状态，跟着浮窗走，
+// 不塞进插件的配置里 —— 插件根本不该知道自己的浮窗被拖到了哪儿。
+func (w *Workbench) saveWidget(svc, id string, x, y int, fold bool) {
+	key := "widget:" + svc + "/" + id
+	blob, err := json.Marshal(map[string]any{"x": x, "y": y, "fold": fold})
 	if err != nil {
 		return
 	}
-	if err := w.ctx.SetConfig("float", json.RawMessage(raw)); err != nil {
+	if err := w.ctx.SetConfig(key, json.RawMessage(blob)); err != nil {
 		w.ctx.Log("warn", "浮窗位置没存下来（下次会回到右上角）："+err.Error(), nil)
 	}
 }

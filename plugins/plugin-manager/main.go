@@ -32,6 +32,12 @@ import (
 // 服务名与方法清单。
 const serviceName = "pluginManager.v1"
 
+// uiServiceName 是界面插件提供的服务。
+//
+// 提供它的插件**不能热卸载**：它的进程就是用户正在看的界面，当场杀掉的话
+// 用户连删除结果都看不到（界面直接没了）。删除界面插件退回"重启生效"。
+const uiServiceName = "ui.v1"
+
 // 运行时目录布局（相对核心解析出的基准目录）。
 const (
 	pluginsDir  = "plugins"
@@ -48,10 +54,36 @@ const (
 // 不需要核心提供任何"禁用"接口。
 const disabledSuffix = ".disabled"
 
+// managerAPI 是本插件用到的那几样核心能力（生产上注入的就是 *plugin.Context）。
+//
+// 抽成接口只为一件事：单测里能换成假的 —— 界面逻辑（点了什么、画成什么样）
+// 不该为了测一下就去连真核心。
+type managerAPI interface {
+	ID() string
+	Can(perm string) bool
+	Consume(name string) (string, error)
+	Invoke(service, method string, args any) (json.RawMessage, error)
+	Emit(event string, payload any) error
+	Log(level, msg string, meta map[string]any)
+	// Capability 直连核心方法（如 core.unload 热卸载、core.restart）。生产上是
+	// *plugin.Context，测试里是 fakeAPI。
+	Capability(method string, params any) (json.RawMessage, error)
+	FSList(path string) (json.RawMessage, error)
+	FSRead(path string) (json.RawMessage, error)
+	FSWrite(path, content string, appendMode, mkdir bool) (json.RawMessage, error)
+	FSDelete(path string, recursive bool) (json.RawMessage, error)
+	FSMove(from, to string) (json.RawMessage, error)
+	FSMkdir(path string, recursive bool) (json.RawMessage, error)
+}
+
 // Manager 实现 plugin.Plugin。
 type Manager struct {
 	ctx  *plugin.Context
+	api  managerAPI
 	root string // 运行时根目录，由核心解析得到（core.json 的 fsRoot，或运行时目录）
+
+	// panel 是插件页那一页的界面状态（见 panel.go）。
+	panel pmPanel
 }
 
 // ---------------------------------------------------------------------------
@@ -64,8 +96,11 @@ type pluginInfo struct {
 	Name        string   `json:"name,omitempty"`
 	Version     string   `json:"version,omitempty"`
 	Runtime     string   `json:"runtime,omitempty"`
+	Entry       string   `json:"entry,omitempty"`
 	Provides    []string `json:"provides,omitempty"`
 	Consumes    []string `json:"consumes,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
+	Compat      string   `json:"compat,omitempty"`     // 兼容的核心版本范围
 	Dir         string   `json:"dir"`                  // 目录名，例如 demo.plugin（禁用后带 .disabled）
 	DirPath     string   `json:"dirPath"`              // 绝对路径
 	Self        bool     `json:"self"`                 // 是否是插件管理器自己
@@ -82,8 +117,11 @@ type manifestFile struct {
 	Description  string            `json:"description"`
 	Version      string            `json:"version"`
 	Runtime      string            `json:"runtime"`
+	Entry        string            `json:"entry"`
 	Provides     []string          `json:"provides"`
 	Consumes     []string          `json:"consumes"`
+	Permissions  []string          `json:"permissions"`
+	Compat       map[string]string `json:"compat"`
 	Dependencies map[string]string `json:"dependencies"`
 }
 
@@ -133,7 +171,7 @@ type deleteArgs struct {
 
 // Activate 注册服务并确定运行时根目录。
 func (m *Manager) Activate(ctx *plugin.Context) error {
-	m.ctx = ctx
+	m.ctx, m.api = ctx, ctx
 
 	root, err := m.resolveRoot()
 	if err != nil {
@@ -151,6 +189,17 @@ func (m *Manager) Activate(ctx *plugin.Context) error {
 		return err
 	}
 
+	// 自带界面：把插件页挂在 UI 插件上。
+	//
+	// 提供 ui.page.* 就代表"我有一页自己的界面" —— UI 插件会来问
+	// list / render / action / key，页面上有什么它一概不知道。
+	if err := ctx.Provide(panelService, map[string]any{
+		"description": "插件页：清单 / 详情 / 启停 / 删除（插件管理器自己渲染）",
+		"methods":     []string{"list", "render", "action", "key"},
+	}); err != nil {
+		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
+	}
+
 	ctx.Log("info", "插件管理器已就绪（pluginManager.v1）", map[string]any{
 		"root":        m.root,
 		"permissions": ctx.Permissions,
@@ -161,7 +210,7 @@ func (m *Manager) Activate(ctx *plugin.Context) error {
 // resolveRoot 询问核心：相对路径 "." 解析到哪里 —— 那就是运行时基准目录。
 // 核心未配置 fsRoot 时是运行时目录，配置了则是 fsRoot。
 func (m *Manager) resolveRoot() (string, error) {
-	raw, err := m.ctx.FSList(".")
+	raw, err := m.api.FSList(".")
 	if err != nil {
 		return "", err
 	}
@@ -179,6 +228,9 @@ func (m *Manager) resolveRoot() (string, error) {
 
 // Handle 分发 core.invoke。
 func (m *Manager) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == panelService {
+		return m.handlePanel(method, args)
+	}
 	if service != serviceName {
 		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "插件管理器不提供服务 %s", service)
 	}
@@ -207,7 +259,7 @@ func (m *Manager) Handle(service, method string, args json.RawMessage) (any, err
 // Deactivate 清理。
 func (m *Manager) Deactivate() error {
 	if m.ctx != nil {
-		m.ctx.Log("info", "插件管理器退出", nil)
+		m.api.Log("info", "插件管理器退出", nil)
 	}
 	return nil
 }
@@ -230,8 +282,8 @@ func (m *Manager) list() (any, error) {
 		"root":      m.root,
 		"count":     len(items),
 		"plugins":   items,
-		"self":      m.ctx.PluginID,
-		"protected": []string{m.ctx.PluginID},
+		"self":      m.api.ID(),
+		"protected": []string{m.api.ID()},
 	}, nil
 }
 
@@ -266,6 +318,16 @@ func (m *Manager) inspect(args json.RawMessage) (any, error) {
 }
 
 // remove 删除一个插件：目录 + 配置 + 日志，并记一条待重启变更。
+// providesService 判断一个插件的 manifest 是否声明了某个服务。
+func providesService(man manifestFile, svc string) bool {
+	for _, s := range man.Provides {
+		if s == svc {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) remove(args json.RawMessage) (any, error) {
 	var in deleteArgs
 	if err := decode(args, &in); err != nil {
@@ -316,45 +378,81 @@ func (m *Manager) remove(args json.RawMessage) (any, error) {
 			"插件管理器缺少 filesystem:delete 权限，无法删除插件")
 	}
 
+	// 先热卸载：停掉它的进程（如果它在运行），目录就能当场删掉，不必等重启。
+	//
+	// 这是规范 2.6"重启生效"的例外（卸载比加载安全）：卸载成功，下面删目录就能
+	// 一次删干净、不用写 pending；卸载失败（进程赖着不走 / 没在运行）就照旧走
+	// 下面的删文件 + 标记 pending 的兜底。热卸载失败不挡住删除。
+	unloaded := false
+	switch {
+	case providesService(target.man, uiServiceName):
+		// 界面插件不热卸载：杀掉它用户就看不到界面了
+		m.api.Log("info", "界面插件跳过热卸载，退回重启删除：杀掉它用户连结果都看不到",
+			map[string]any{"pluginId": target.man.ID})
+	default:
+		res, err := m.api.Capability("core.unload", map[string]any{"id": target.man.ID})
+		if err != nil {
+			m.api.Log("warn", "热卸载失败，退回重启删除："+err.Error(), map[string]any{"pluginId": target.man.ID})
+			break
+		}
+		var u struct {
+			Stopped bool `json:"stopped"`
+		}
+		if json.Unmarshal(res, &u) == nil {
+			unloaded = u.Stopped
+		}
+	}
+
 	removed := make([]deleteResult, 0, len(plan))
 	for i, p := range plan {
 		res, _ := m.deletePath(p, i == 0) // 第 0 项是插件目录，需要递归
 		removed = append(removed, res)
 	}
 
-	// 规范 2.6：记一条待重启变更。核心在下次启动、插件还没起来的时候执行删除 ——
-	// 那时没有进程占用可执行文件、日志也还没打开，能删干净。
-	var errs []string
-	marked := true
-	if err := m.markPending("delete", target.man.ID, target.info.Dir); err != nil {
-		marked = false
-		errs = append(errs, "写入 pending-restart.json 失败: "+err.Error())
-	}
-
-	// 复核一遍：还剩下的会在下次启动时被核心清掉
+	// 复核一遍：还剩下的（删不掉的）会在下次启动时被核心清掉
 	deferred := make([]string, 0, len(plan))
 	for _, p := range plan {
 		if m.exists(p) {
 			deferred = append(deferred, p)
 		}
 	}
+
+	// 规范 2.6：只有删不干净的才记待重启变更。核心在下次启动、插件还没起来的
+	// 时候执行删除 —— 那时没有进程占用，能删干净。
+	//
+	// 全删干净了就不记：否则 pending-restart.json 里留一条"下次启动白删一遍"
+	// 的记录，是垃圾。
+	var errs []string
+	marked := false
+	if len(deferred) > 0 {
+		if err := m.markPending("delete", target.man.ID, target.info.Dir); err != nil {
+			errs = append(errs, "写入 pending-restart.json 失败: "+err.Error())
+		} else {
+			marked = true
+		}
+	}
+
 	status := "removed"
 	for _, p := range deferred {
 		if p == target.info.DirPath {
 			status = "deferred" // 目录还在：多半是它正在运行，文件被占用
 		}
 	}
+	restartRequired := len(deferred) > 0
 	note := "插件目录已从 plugins/ 移除；仍在占用的文件（如日志）会在下次启动时清干净。重启后生效。"
-	if status == "deferred" {
+	switch {
+	case unloaded && !restartRequired:
+		note = "已当场卸载并删除，不用重启。"
+	case status == "deferred":
 		note = "目标正在运行，文件被占用，已标记删除：下次启动时核心会在加载插件前把它清除。"
 	}
 
-	_ = m.ctx.Emit("plugin.deleted", map[string]any{
+	_ = m.api.Emit("plugin.deleted", map[string]any{
 		"pluginId": target.man.ID,
 		"dir":      target.info.Dir,
 		"root":     m.root,
 	})
-	m.ctx.Log("info", "已删除插件", map[string]any{
+	m.api.Log("info", "已删除插件", map[string]any{
 		"pluginId": target.man.ID,
 		"dir":      target.info.Dir,
 		"warnings": len(warns),
@@ -368,7 +466,7 @@ func (m *Manager) remove(args json.RawMessage) (any, error) {
 		"deferred":        deferred,
 		"warnings":        warns,
 		"errors":          errs,
-		"restartRequired": true,
+		"restartRequired": restartRequired,
 		"pendingRestart":  marked,
 		"note":            note,
 	}, nil
@@ -442,7 +540,7 @@ func (m *Manager) setEnabled(args json.RawMessage, enable bool) (any, error) {
 	if enable {
 		action = "enable"
 	}
-	if _, err := m.ctx.FSMove(from, to); err != nil {
+	if _, err := m.api.FSMove(from, to); err != nil {
 		// 和删不掉是同一个原因：插件正在运行，目录被占用，连改名都会被拒。
 		// 记一条待重启变更 —— 核心启动时还没有任何插件在跑，改名一定成功。
 		if perr := m.markPending(action, target.info.ID, target.info.Dir); perr != nil {
@@ -462,12 +560,12 @@ func (m *Manager) setEnabled(args json.RawMessage, enable bool) (any, error) {
 		}, nil
 	}
 
-	_ = m.ctx.Emit("plugin.state", map[string]any{
+	_ = m.api.Emit("plugin.state", map[string]any{
 		"pluginId": target.info.ID,
 		"enabled":  enable,
 		"dir":      filepath.Base(to),
 	})
-	m.ctx.Log("info", "已切换插件启用状态", map[string]any{
+	m.api.Log("info", "已切换插件启用状态", map[string]any{
 		"pluginId": target.info.ID,
 		"enabled":  enable,
 		"dir":      filepath.Base(to),
@@ -547,13 +645,21 @@ func (m *Manager) scan() ([]installed, error) {
 		it.info.Name = man.Name
 		it.info.Version = man.Version
 		it.info.Runtime = man.Runtime
+		it.info.Entry = man.Entry
 		it.info.Provides = man.Provides
 		it.info.Consumes = man.Consumes
+		it.info.Permissions = man.Permissions
+		it.info.Compat = man.Compat["core"]
 		it.info.Description = man.Description
-		it.info.Self = man.ID != "" && man.ID == m.ctx.PluginID
+		it.info.Self = man.ID != "" && man.ID == m.api.ID()
 		out = append(out, it)
 	}
 	sort.Slice(out, func(i, j int) bool {
+		// 读不出 manifest 的排最后：它们只能看一眼、什么都动不了，
+		// 摆在最前面会让每次打开这一页都先撞上一段错误说明。
+		if out[i].info.Unreadable != out[j].info.Unreadable {
+			return !out[i].info.Unreadable
+		}
 		if out[i].info.ID != out[j].info.ID {
 			return out[i].info.ID < out[j].info.ID
 		}
@@ -575,7 +681,7 @@ func (m *Manager) plan(target installed, keepLogs bool) []string {
 // alive 用 core.consume 探测插件是否有服务正在提供（说明它当前在运行）。
 func (m *Manager) alive(target installed) bool {
 	for _, svc := range target.man.Provides {
-		if id, err := m.ctx.Consume(svc); err == nil && id != "" {
+		if id, err := m.api.Consume(svc); err == nil && id != "" {
 			return true
 		}
 	}
@@ -584,7 +690,7 @@ func (m *Manager) alive(target installed) bool {
 
 // deletePath 经核心删除一个路径。
 func (m *Manager) deletePath(path string, recursive bool) (deleteResult, error) {
-	raw, err := m.ctx.FSDelete(path, recursive)
+	raw, err := m.api.FSDelete(path, recursive)
 	if err != nil {
 		return deleteResult{Path: path, Error: err.Error()}, err
 	}
@@ -611,14 +717,7 @@ func (m *Manager) exists(path string) bool {
 }
 
 // hasPerm 检查本插件是否被授予了某个权限。
-func (m *Manager) hasPerm(perm string) bool {
-	for _, p := range m.ctx.Permissions {
-		if p == perm {
-			return true
-		}
-	}
-	return false
-}
+func (m *Manager) hasPerm(perm string) bool { return m.api.Can(perm) }
 
 // markPending 往 pending-restart.json 追加一条待重启变更（delete / enable / disable）。
 //
@@ -630,18 +729,26 @@ func (m *Manager) markPending(action, id, dir string) error {
 	// 文件不存在或内容损坏都从空列表开始：记录只是可追溯性，失败不该挡住删除
 	_ = m.readJSON(path, &list)
 
+	// 去重：同一个动作（同一 id + 目录）不重复记 —— 重复删除同一插件时，
+	// 记录会越堆越多，重启时核心白删一遍。
+	for _, c := range list {
+		if c.Action == action && c.PluginID == id && c.Dir == dir {
+			return nil
+		}
+	}
+
 	list = append(list, pendingChange{
 		Action:   action,
 		PluginID: id,
 		Dir:      dir,
-		By:       m.ctx.PluginID, // 核心启动时会核对此插件是否真有 filesystem:delete
+		By:       m.api.ID(), // 核心启动时会核对此插件是否真有 filesystem:delete
 		At:       time.Now().UTC().Format(time.RFC3339),
 	})
 	blob, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
 		return err
 	}
-	_, err = m.ctx.FSWrite(path, string(blob)+"\n", false, true)
+	_, err = m.api.FSWrite(path, string(blob)+"\n", false, true)
 	return err
 }
 
@@ -650,7 +757,7 @@ func (m *Manager) markPending(action, id, dir string) error {
 // ---------------------------------------------------------------------------
 
 func (m *Manager) listDir(path string) ([]entry, error) {
-	raw, err := m.ctx.FSList(path)
+	raw, err := m.api.FSList(path)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +773,7 @@ func (m *Manager) listDir(path string) ([]entry, error) {
 
 // readJSON 读文件并把 content 字段反序列化到 v。
 func (m *Manager) readJSON(path string, v any) error {
-	raw, err := m.ctx.FSRead(path)
+	raw, err := m.api.FSRead(path)
 	if err != nil {
 		return err
 	}
@@ -841,7 +948,7 @@ func (m *Manager) create(args json.RawMessage) (any, error) {
 	files["manifest.json"] = string(blob) + "\n"
 
 	written := make([]string, 0, len(files))
-	if _, err := m.ctx.FSMkdir(base, true); err != nil {
+	if _, err := m.api.FSMkdir(base, true); err != nil {
 		return nil, plugin.Errorf(plugin.CodeInternalError, "创建插件目录失败: %v", err)
 	}
 	for _, name := range []string{"manifest.json", entry, "main.go"} {
@@ -849,7 +956,7 @@ func (m *Manager) create(args json.RawMessage) (any, error) {
 		if !ok {
 			continue
 		}
-		if _, err := m.ctx.FSWrite(filepath.Join(base, name), content, false, true); err != nil {
+		if _, err := m.api.FSWrite(filepath.Join(base, name), content, false, true); err != nil {
 			return nil, err
 		}
 		written = append(written, name)
@@ -885,7 +992,7 @@ func (m *Manager) registerTools(in createParams) []string {
 	if len(in.Tools) == 0 || len(in.Provides) == 0 {
 		return nil
 	}
-	if _, err := m.ctx.Consume("toolExecutor.v1"); err != nil {
+	if _, err := m.api.Consume("toolExecutor.v1"); err != nil {
 		return nil
 	}
 	service := in.Provides[0]
@@ -907,8 +1014,8 @@ func (m *Manager) registerTools(in createParams) []string {
 			"method":      method,
 			"schema":      schema,
 		}
-		if _, err := m.ctx.Invoke("toolExecutor.v1", "register", params); err != nil {
-			m.ctx.Log("warn", "注册 AI 工具失败", map[string]any{"tool": name, "err": err.Error()})
+		if _, err := m.api.Invoke("toolExecutor.v1", "register", params); err != nil {
+			m.api.Log("warn", "注册 AI 工具失败", map[string]any{"tool": name, "err": err.Error()})
 			continue
 		}
 		done = append(done, name)

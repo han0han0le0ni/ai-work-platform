@@ -33,6 +33,25 @@ func (c *Context) Provide(name string, meta any) error {
 	return err
 }
 
+// ID 返回本插件的 ID（与 PluginID 字段等价）。
+//
+// 把它做成方法，是为了让插件能把"自己用到的那几样能力"抽成一个接口
+// （单测里换成假的核心），而字段是抽不进接口的。
+func (c *Context) ID() string { return c.PluginID }
+
+// Can 判断本插件是否被授予了某个权限，例如 filesystem:delete。
+//
+// 动手前先自检一道，比撞上 -32002 再解释好：用户看到的是"缺哪个权限"，
+// 而不是一句看不懂的错误码。
+func (c *Context) Can(perm string) bool {
+	for _, p := range c.Permissions {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
 // Consume 发现服务，返回提供者插件 ID。
 func (c *Context) Consume(name string) (string, error) {
 	resp, err := c.s.call("core.consume", map[string]any{"name": name}, 10*time.Second)

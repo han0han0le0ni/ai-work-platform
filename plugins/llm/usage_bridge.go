@@ -70,7 +70,8 @@ func openaiChatMetered(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 		meterEmit(l, cfg, nil, false, msg)
 		if status == 401 || status == 403 {
 			return nil, plugin.Errorf(plugin.CodeInternalError,
-				"接口拒绝了这个密钥（HTTP %d）：检查 API Key 是否填对", status)
+				"接口拒绝了这个密钥（HTTP %d）：检查 API Key 是否填对%s",
+				status, authHint(status, cfg.BaseURL))
 		}
 		return nil, plugin.Errorf(plugin.CodeInternalError, "模型调用失败（HTTP %d）：%s", status, msg)
 	}

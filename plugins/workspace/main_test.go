@@ -1,14 +1,13 @@
 package main
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// 围栏是这个插件的核心价值：工作目录之外的路径一律进不来
-func TestResolveConfinesToRoot(t *testing.T) {
+// 相对路径以工作目录为基准拼出来
+func TestResolveUsesRootForRelativePaths(t *testing.T) {
 	root := t.TempDir()
 	w := &Workspace{root: root}
 
@@ -34,38 +33,45 @@ func TestResolveConfinesToRoot(t *testing.T) {
 	}
 }
 
-// 各种逃出去的写法都必须被挡下
-func TestResolveRejectsEscaping(t *testing.T) {
+// 围栏已取消：落在工作目录之外的绝对路径也照单全收
+func TestResolveAllowsAbsolutePathsOutsideRoot(t *testing.T) {
 	root := t.TempDir()
 	w := &Workspace{root: root}
 
-	bad := []string{
-		"..",
-		"../",
-		"../..",
-		".." + string(os.PathSeparator) + "etc",
-		".." + string(os.PathSeparator) + ".." + string(os.PathSeparator) + "etc" + string(os.PathSeparator) + "passwd",
-		"a/../../b",
-		"sub/../../../outside",
+	outside := []string{
 		filepath.Join(filepath.Dir(root), "outside"),
 		filepath.Join(filepath.Dir(root), "outside", "a.txt"),
+		filepath.Join(root, "a", "..", "..", "b.txt"),
 	}
-	for _, in := range bad {
+	for _, in := range outside {
 		got, err := w.resolve(in)
-		if err == nil {
-			t.Fatalf("resolve(%q) 应被拒绝，实际放行到 %q", in, got)
+		if err != nil {
+			t.Fatalf("resolve(%q) 不应再被围栏拒绝: %v", in, err)
 		}
-		if !strings.Contains(err.Error(), "越界") {
-			t.Fatalf("拒绝理由应说明越界，实际 %q", err.Error())
+		if got != filepath.Clean(in) {
+			t.Fatalf("resolve(%q) = %q，期望 %q", in, got, filepath.Clean(in))
 		}
 	}
 }
 
-// 没指定工作目录时，任何路径操作都要先提示去设置
-func TestResolveRequiresRoot(t *testing.T) {
+// 没指定工作目录时，绝对路径照样可用（全盘可访问）
+func TestResolveAbsolutePathWithoutRoot(t *testing.T) {
+	w := &Workspace{}
+	abs := filepath.Join(t.TempDir(), "a.txt")
+	got, err := w.resolve(abs)
+	if err != nil {
+		t.Fatalf("未设置工作目录时绝对路径应可用: %v", err)
+	}
+	if got != abs {
+		t.Fatalf("resolve(%q) = %q，期望 %q", abs, got, abs)
+	}
+}
+
+// 没指定工作目录时，相对路径没有落脚点，先提示去设置
+func TestResolveRequiresRootForRelativePath(t *testing.T) {
 	w := &Workspace{}
 	if _, err := w.resolve("a.txt"); err == nil || !strings.Contains(err.Error(), "setRoot") {
-		t.Fatalf("未设置工作目录时应提示先 setRoot，实际 %v", err)
+		t.Fatalf("未设置工作目录时相对路径应提示先 setRoot，实际 %v", err)
 	}
 }
 

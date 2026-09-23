@@ -119,17 +119,33 @@ type Step struct {
 // Agent 实现 plugin.Plugin。
 type Agent struct {
 	ctx *plugin.Context
+
+	// panel 是「预算」那一页的界面状态（见 panel.go）。
+	//
+	// 编排预算（最多几轮工具、超时多久、单条结果上限）是 agent 自己的参数，
+	// 不该由界面替它画。
+	panel agentPanel
 }
 
 // Activate 注册 agent.v1。
 func (a *Agent) Activate(ctx *plugin.Context) error {
 	a.ctx = ctx
+	a.panel = newAgentPanel()
 	if err := ctx.Provide(serviceName, map[string]any{
 		"description": "编排 LLM 与工具：推理 → 调用工具 → 再推理，直到给出最终回答",
 		"methods":     []string{"run", "tools", "info", "configure"},
 	}); err != nil {
 		return err
 	}
+
+	// 自带界面：把「预算」挂在 UI 插件上。
+	if err := ctx.Provide(panelService, map[string]any{
+		"description": "预算页：工具调用上限 / 不限制（agent 自己渲染）",
+		"methods":     []string{"list", "render", "action", "key"},
+	}); err != nil {
+		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
+	}
+
 	ctx.Log("info", "Agent 已就绪", map[string]any{
 		"hasLLM":  consumeOK(ctx, llmService),
 		"hasTool": consumeOK(ctx, toolService),
@@ -139,6 +155,9 @@ func (a *Agent) Activate(ctx *plugin.Context) error {
 
 // Handle 处理 core.invoke。
 func (a *Agent) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == panelService {
+		return a.handlePanel(method, args)
+	}
 	if service != serviceName {
 		return nil, plugin.Errorf(plugin.CodeServiceNotFound, "Agent 插件不提供服务 %s", service)
 	}
