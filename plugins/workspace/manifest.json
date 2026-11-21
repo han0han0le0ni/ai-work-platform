@@ -6,9 +6,9 @@
   "apiVersion": "1",
   "entry": "main",
   "runtime": "binary",
-  "provides": ["workspace.v1", "ui.panel.v1"],
+  "provides": ["workspace.v1", "ui.page.workspace.v1"],
   "consumes": [],
-  "permissions": ["filesystem:read", "filesystem:write", "filesystem:delete"],
+  "permissions": ["filesystem:read", "filesystem:write", "filesystem:delete", "shell:pickfolder"],
   "compat": {
     "core": ">=1.0 <2.0"
   }

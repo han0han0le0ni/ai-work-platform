@@ -888,6 +888,26 @@ func (h *Host) HandleRequest(p *process.Plugin, msg *jsonrpc.Message) {
 			}
 		}()
 
+	case "core.shutdown":
+		// 停止核心：所有插件优雅退出，进程以退出码 0 收尾（启动器随之关闭控制台）。
+		//
+		// 与 restart 的区别只在最后一步：这里不派生新核心，平台完全停止，
+		// 再次使用要重新双击启动器。界面上「停止平台」按的就是这一下。
+		// 同样只认官方插件：一按全系统都停，第三方不该有。
+		if !strings.HasPrefix(p.Spec.ID, officialPrefix) {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodePermissionDenied,
+				"只有官方插件可以停止核心（%s）", p.Spec.ID))
+			return
+		}
+		h.logs.Core("warn", "插件 %s 请求停止核心", p.Spec.ID)
+		p.Respond(msg.ID, map[string]any{"ok": true})
+		// 先回话、再动手：发起者自己也会被杀，得让它先把结果送到界面上。
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			h.CloseControl()
+			h.Shutdown()
+		}()
+
 	case "core.unload":
 		// 热卸载：停掉一个插件的进程、注销它的服务，让删除能当场完成，不必等重启。
 		//
@@ -930,6 +950,73 @@ func (h *Host) HandleRequest(p *process.Plugin, msg *jsonrpc.Message) {
 			"ok": true, "id": unloadParams.ID, "stopped": true,
 			"removedServices": removed,
 		})
+
+	case "core.load":
+		// 热加载：把一个已停用（或刚启用）的插件当场拉起来，不必重启整个平台。
+		//
+		// 这是 core.unload 的反向操作。与卸载不同，加载要检查依赖：
+		// manifest 里 consumes 的服务必须已经注册，否则插件起来后调用会全部失败。
+		// 依赖不满足时不硬起，把原因抛回上层，由界面提示"重启后生效"。
+		//
+		// 只认官方插件：这能力能拉起任意插件，第三方不该有。
+		if !strings.HasPrefix(p.Spec.ID, officialPrefix) {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodePermissionDenied,
+				"只有官方插件可以加载插件（%s）", p.Spec.ID))
+			return
+		}
+		var loadParams struct {
+			ID string `json:"id"`
+		}
+		if err := decodeParams(msg, &loadParams); err != nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInvalidParams, "%v", err))
+			return
+		}
+		if loadParams.ID == "" {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInvalidParams, "缺少 id"))
+			return
+		}
+		if cur := h.sup.Get(loadParams.ID); cur != nil && cur.Alive() {
+			p.Respond(msg.ID, map[string]any{"ok": true, "id": loadParams.ID, "loaded": false})
+			return
+		}
+		discs, err := loader.Scan(h.PluginsDir())
+		if err != nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInternalError, "扫描插件目录失败: %v", err))
+			return
+		}
+		var target *loader.Discovery
+		for i := range discs {
+			if discs[i].ID() == loadParams.ID {
+				target = &discs[i]
+				break
+			}
+		}
+		if target == nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInvalidParams,
+				"未找到插件 %s（目录名需以 .plugin 结尾）", loadParams.ID))
+			return
+		}
+		if target.Err != nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInternalError, "插件不可用: %v", target.Err))
+			return
+		}
+		var missing []string
+		for _, svc := range target.Manifest.Consumes {
+			if _, ok := h.reg.Lookup(svc); !ok {
+				missing = append(missing, svc)
+			}
+		}
+		if len(missing) > 0 {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInternalError,
+				"缺少依赖服务 %v，需要重启平台按依赖顺序加载", missing))
+			return
+		}
+		h.logs.Core("info", "插件 %s 请求热加载 %s", p.Spec.ID, loadParams.ID)
+		if err := h.startPlugin(*target); err != nil {
+			p.RespondError(msg.ID, jsonrpc.NewError(jsonrpc.CodeInternalError, "加载失败: %v", err))
+			return
+		}
+		p.Respond(msg.ID, map[string]any{"ok": true, "id": loadParams.ID, "loaded": true})
 
 	default:
 		// 规范 3.5 能力代理：文件 / 网络 / 系统调用由核心代为执行，

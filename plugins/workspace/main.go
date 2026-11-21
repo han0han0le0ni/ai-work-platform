@@ -86,8 +86,8 @@ func (w *Workspace) Activate(ctx *plugin.Context) error {
 
 	// 自带界面：把"选工作目录"这一页挂在 UI 插件上。
 	//
-	// 插件提供 ui.panel.v1 就代表"我有一页自己的界面" —— UI 插件会来问
-	// list / render / action，其余什么都不需要知道。
+	// 插件在 manifest 里声明 ui.page.workspace.v1 就代表"我有一页自己的界面" ——
+	// UI 插件会来问 list / render / action，其余什么都不需要知道。
 	if err := ctx.Provide(panelService, map[string]any{
 		"description": "工作区自带的一页界面：浏览目录、挑工作目录（插件自己渲染）",
 		"methods":     []string{"list", "render", "action", "key"},
@@ -481,9 +481,16 @@ func (w *Workspace) tree(args json.RawMessage) (any, error) {
 // 读写
 // ---------------------------------------------------------------------------
 
+// read 读一个文件。
+//
+// encoding 是给中文遗留编码留的那条路：绝大多数中文 .txt / .csv / .log 并不是
+// UTF-8 写的，而是 GB18030（Excel 导的表格、老编辑器存的文本、国产软件的日志）。
+// 不注明的话核心按 UTF-8 硬读，读出来一整篇 U+FFFD —— 不是文件坏了，是没说方言。
+// 给 "gb18030"（"gbk" / "gb2312" 也一样）即可，其余情况保持原样。
 func (w *Workspace) read(args json.RawMessage) (any, error) {
 	var in struct {
-		Path string `json:"path"`
+		Path     string `json:"path"`
+		Encoding string `json:"encoding"`
 	}
 	if err := decode(args, &in); err != nil {
 		return nil, err
@@ -495,7 +502,12 @@ func (w *Workspace) read(args json.RawMessage) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	raw, err := w.ctx.FSRead(abs)
+	enc := strings.TrimSpace(in.Encoding)
+	params := map[string]any{"path": abs}
+	if enc != "" {
+		params["encoding"] = enc
+	}
+	raw, err := w.ctx.Capability("core.fs.read", params)
 	if err != nil {
 		return nil, err
 	}
@@ -503,18 +515,23 @@ func (w *Workspace) read(args json.RawMessage) (any, error) {
 		Path      string `json:"path"`
 		Size      int64  `json:"size"`
 		Content   string `json:"content"`
+		Encoding  string `json:"encoding"`
 		Truncated bool   `json:"truncated"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("解析读取结果失败: %w", err)
 	}
-	return map[string]any{
+	res := map[string]any{
 		"path":      w.rel(abs),
 		"absPath":   abs,
 		"size":      out.Size,
 		"content":   out.Content,
 		"truncated": out.Truncated,
-	}, nil
+	}
+	if out.Encoding != "" {
+		res["encoding"] = out.Encoding
+	}
+	return res, nil
 }
 
 func (w *Workspace) write(args json.RawMessage) (any, error) {

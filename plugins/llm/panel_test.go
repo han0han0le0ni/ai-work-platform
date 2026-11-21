@@ -330,3 +330,34 @@ func TestPanelList(t *testing.T) {
 		t.Fatalf("服务名要守约定（ui.page.<名字>.v1），实际 %q", panelService)
 	}
 }
+
+// 宽屏两栏并排时，右栏的热区不能还落在左栏的列上。
+//
+// 这是用户报过的真实 bug：entryBuilder 里的按钮 / chip / 输入框都按
+// 「从第 0 列开始」登记绝对坐标，两栏并排后文本是顺序追加的所以位置对，
+// 热区却还留在左栏那一列 —— 右栏按钮"看得见、点不中"。
+func TestPanelWideRightColumnHitsAreShifted(t *testing.T) {
+	p := testPanel()
+	res := renderPanel(p, 100, 40, 0) // 100 >= llmWideMin，走两栏
+	rightStart := llmLeftW + 2
+
+	foundSave := false
+	for i := range res.Hits {
+		h := &res.Hits[i]
+		switch {
+		case h.Action == "btn" && h.Arg == "save":
+			foundSave = true
+			if h.X < rightStart {
+				t.Fatalf("右栏「保存并生效」热区 x=%d 还落在左栏（应 >= %d）", h.X, rightStart)
+			}
+		case h.Action == "mode" && h.Arg == "cloud":
+			// 左栏的 chip 必须整个待在左栏，不许越到右栏
+			if h.X+h.W > llmLeftW {
+				t.Fatalf("左栏「云端」chip 热区越界到右栏：%+v", h)
+			}
+		}
+	}
+	if !foundSave {
+		t.Fatal("应有「保存并生效」按钮的热区")
+	}
+}

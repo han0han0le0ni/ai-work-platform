@@ -153,8 +153,18 @@ func (b *Builder) build(args json.RawMessage) (any, error) {
 	}
 	if !ok {
 		result["note"] = "编译失败，按 stderr 修源码后重试"
-		return result, plugin.Errorf(plugin.CodeInternalError, "编译失败（exit %d）：%s",
-			res.ExitCode, firstLine(res.Stderr))
+		// 错误消息必须带完整 stderr：调用方（如「一键造插件」的编译自愈）
+		// 要靠真实报错让模型修代码，只给首行 "# command-line-arguments"
+		// 等于什么都没说。超长时截断保护 JSON-RPC 帧。
+		detail := strings.TrimSpace(res.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(res.Stdout)
+		}
+		if len(detail) > 4000 {
+			detail = detail[:4000] + "\n…（报错过长已截断）"
+		}
+		return result, plugin.Errorf(plugin.CodeInternalError, "编译失败（exit %d）：\n%s",
+			res.ExitCode, detail)
 	}
 	result["note"] = "编译成功，重启核心后加载"
 	return result, nil

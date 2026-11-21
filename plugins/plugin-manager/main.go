@@ -32,6 +32,10 @@ import (
 // 服务名与方法清单。
 const serviceName = "pluginManager.v1"
 
+// contribService 是 DSH 式"UI 贡献"服务：壳子来问这个插件要往哪些插槽
+// （侧栏导航 / 脚部动作 / 顶栏动作）放什么，而不是由插件自己画一整页。
+const contribService = "ui.contrib.v1"
+
 // uiServiceName 是界面插件提供的服务。
 //
 // 提供它的插件**不能热卸载**：它的进程就是用户正在看的界面，当场杀掉的话
@@ -183,7 +187,7 @@ func (m *Manager) Activate(ctx *plugin.Context) error {
 		"description": "插件管理：列出 / 检查 / 启停 / 删除插件（删除连配置与日志一起清理，重启后生效）",
 		"methods": []string{
 			"list", "inspect", "enable", "disable", "setEnabled",
-			"delete", "create", "purge",
+			"delete", "create", "purge", "rules",
 		},
 	}); err != nil {
 		return err
@@ -198,6 +202,15 @@ func (m *Manager) Activate(ctx *plugin.Context) error {
 		"methods":     []string{"list", "render", "action", "key"},
 	}); err != nil {
 		ctx.Log("warn", "自带界面没能挂上（"+err.Error()+"），功能不受影响", nil)
+	}
+
+	// DSH 式 UI 贡献：告诉壳子"规则页放侧栏哪一格、插件页放顶栏哪个按钮"。
+	// 壳子负责几何与渲染，这里只声明条目。
+	if err := ctx.Provide(contribService, map[string]any{
+		"description": "UI 贡献：侧栏导航 / 顶栏动作（DSH slot 模型）",
+		"methods":     []string{"list"},
+	}); err != nil {
+		ctx.Log("warn", "UI 贡献没能注册（"+err.Error()+"），插件页仍可从面板列表进入", nil)
 	}
 
 	ctx.Log("info", "插件管理器已就绪（pluginManager.v1）", map[string]any{
@@ -228,6 +241,9 @@ func (m *Manager) resolveRoot() (string, error) {
 
 // Handle 分发 core.invoke。
 func (m *Manager) Handle(service, method string, args json.RawMessage) (any, error) {
+	if service == contribService {
+		return m.handleContrib(method)
+	}
 	if service == panelService {
 		return m.handlePanel(method, args)
 	}
@@ -251,9 +267,30 @@ func (m *Manager) Handle(service, method string, args json.RawMessage) (any, err
 		return m.create(args)
 	case "purge":
 		return m.purge()
+	case "rules":
+		return m.rules()
 	default:
 		return nil, plugin.Errorf(plugin.CodeMethodNotFound, "%s 不支持方法 %s", service, method)
 	}
+}
+
+// handleContrib 回答"我往哪些插槽放什么"。
+//
+// 条目只声明意图：slot / id / label / order / 页面目标。壳子决定几何与样式，
+// 所以这里不出现任何尺寸、颜色或绘制代码。
+func (m *Manager) handleContrib(method string) (any, error) {
+	if method != "list" {
+		return nil, plugin.Errorf(plugin.CodeMethodNotFound, "%s 不支持方法 %s", contribService, method)
+	}
+	return map[string]any{
+		"contributions": []map[string]any{
+			{
+				"slot": "header.action", "id": "plugins", "label": "插件",
+				"icon": "⌘", "order": 20,
+				"page": map[string]any{"native": "plugins"},
+			},
+		},
+	}, nil
 }
 
 // Deactivate 清理。
@@ -540,7 +577,25 @@ func (m *Manager) setEnabled(args json.RawMessage, enable bool) (any, error) {
 	if enable {
 		action = "enable"
 	}
+
+	// 禁用前先热卸载：Windows 会锁住运行中插件的目录，不停进程连改名都会被拒。
+	// 卸载失败不阻断流程——后面改名失败仍会退回"标记待重启"。
+	unloaded := false
+	if !enable {
+		if raw, uerr := m.api.Capability("core.unload", map[string]any{"id": target.info.ID}); uerr == nil {
+			var res struct {
+				Stopped bool `json:"stopped"`
+			}
+			_ = decode(raw, &res)
+			unloaded = res.Stopped
+		}
+	}
+
 	if _, err := m.api.FSMove(from, to); err != nil {
+		// 刚才若已卸载成功，尽量把插件拉回来，避免"进程停了但界面还显示已启用"。
+		if unloaded {
+			_, _ = m.api.Capability("core.load", map[string]any{"id": target.info.ID})
+		}
 		// 和删不掉是同一个原因：插件正在运行，目录被占用，连改名都会被拒。
 		// 记一条待重启变更 —— 核心启动时还没有任何插件在跑，改名一定成功。
 		if perr := m.markPending(action, target.info.ID, target.info.Dir); perr != nil {
@@ -571,16 +626,27 @@ func (m *Manager) setEnabled(args json.RawMessage, enable bool) (any, error) {
 		"dir":      filepath.Base(to),
 	})
 
-	note := "已禁用：重启后不再加载（目录改名为 " + filepath.Base(to) + "）"
+	// 热生效：禁用已在改名前提早卸载；启用则在改名后当场加载。
+	// 热加载失败（比如依赖服务还没起来）就退回"重启后生效"，不隐藏问题。
+	restartRequired := false
+	note := "已禁用：已热卸载，服务当场注销，无需重启"
+	if !unloaded {
+		note = "已禁用：插件未在运行，无需重启"
+	}
 	if enable {
-		note = "已启用：重启后恢复加载（目录改名为 " + filepath.Base(to) + "）"
+		if _, lerr := m.api.Capability("core.load", map[string]any{"id": target.info.ID}); lerr == nil {
+			note = "已启用：服务已当场注册，无需重启"
+		} else {
+			restartRequired = true
+			note = "已启用，但热加载未成功（" + lerr.Error() + "），重启后生效"
+		}
 	}
 	return map[string]any{
 		"pluginId":        target.info.ID,
 		"dir":             filepath.Base(to),
 		"enabled":         enable,
 		"changed":         true,
-		"restartRequired": true,
+		"restartRequired": restartRequired,
 		"note":            note,
 	}, nil
 }
@@ -1327,7 +1393,7 @@ func dependents(all []installed, target installed) []string {
 	}
 	for _, give := range target.man.Provides {
 		if give == "ui.v1" {
-			out = append(out, "该插件提供 ui.v1：删除并重启后将没有界面，可用引导菜单装回 minimal-ui 或 workbench")
+			out = append(out, "该插件提供 ui.v1：删除并重启后将没有界面，可用引导菜单装回 minimal-ui 或 aurora（或 workbench）")
 		}
 	}
 	return out

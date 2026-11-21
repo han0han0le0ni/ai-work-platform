@@ -210,6 +210,74 @@ func TestUnknownNodeIsRejected(t *testing.T) {
 	if err := s.SwitchVersion("nope", 1); err == nil {
 		t.Fatal("翻一条不存在的消息应当报错")
 	}
+	if _, err := s.DeleteNode("nope"); err == nil {
+		t.Fatal("删一条不存在的消息应当报错")
+	}
+}
+
+// 删一条用户消息：它连同下游的整棵子树一起消失，前缀消息原样保留。
+func TestDeleteNodeRemovesSubtree(t *testing.T) {
+	s := testSession(t)
+	u1, a1, u2, a2 := buildTimeline(t, s)
+
+	removed, err := s.DeleteNode(u2.ID)
+	if err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("应删掉 u2 和它的回复 a2 共 2 个节点，实际 %d", removed)
+	}
+	if got := ids(s.Path()); !reflect.DeepEqual(got, []string{u1.ID, a1.ID}) {
+		t.Fatalf("删除后路径 = %v，想要 [u1 a1]", got)
+	}
+	for _, id := range []string{u2.ID, a2.ID} {
+		if _, ok := s.Nodes[id]; ok {
+			t.Fatalf("节点 %s 应当已从树里移除", id)
+		}
+	}
+	if len(a1.Children) != 0 {
+		t.Fatalf("a1 失去唯一孩子后应当变成叶子，实际 children=%v", a1.Children)
+	}
+}
+
+// 删掉当前选中的版本：选中位回退到前一个兄弟，旧时间线重新可见。
+func TestDeleteActiveVersionFallsBack(t *testing.T) {
+	s := testSession(t)
+	u1, a1, u2, a2 := buildTimeline(t, s)
+	nu2, err := s.EditNode(u2.ID, "第二问（改过）")
+	if err != nil {
+		t.Fatalf("编辑失败: %v", err)
+	}
+	na2 := s.AddNode(nu2.ID, roleAssistant, "重答", agentService, "")
+
+	if _, err := s.DeleteNode(nu2.ID); err != nil {
+		t.Fatalf("删除失败: %v", err)
+	}
+	// 新版本连同它的新回复一起没了，旧时间线自动接回来
+	if got := ids(s.Path()); !reflect.DeepEqual(got, []string{u1.ID, a1.ID, u2.ID, a2.ID}) {
+		t.Fatalf("删除后应回退到旧时间线，实际 %v", got)
+	}
+	if _, ok := s.Nodes[na2.ID]; ok {
+		t.Fatal("被删版本子树里的回复也应一起删除")
+	}
+}
+
+// 把根节点删光：会话回到空树，Path() 为空且不报错。
+func TestDeleteRootLeavesEmptySession(t *testing.T) {
+	s := testSession(t)
+	u1, a1, _, _ := buildTimeline(t, s)
+	if _, err := s.DeleteNode(u1.ID); err != nil {
+		t.Fatalf("删除根节点失败: %v", err)
+	}
+	if len(s.Path()) != 0 {
+		t.Fatalf("根删光后路径应为空，实际 %v", ids(s.Path()))
+	}
+	if len(s.Roots) != 0 || s.RootActive != 0 {
+		t.Fatalf("根组应为空且选中位归零，实际 roots=%v active=%d", s.Roots, s.RootActive)
+	}
+	if _, ok := s.Nodes[a1.ID]; ok {
+		t.Fatal("根下游的回复应一起删除")
+	}
 }
 
 // 删会话只带走自己，别的会话逐字段不变。

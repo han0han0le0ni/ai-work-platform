@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"aiwork/core/jsonrpc"
 )
@@ -367,6 +368,149 @@ func TestFSReadBase64(t *testing.T) {
 	}
 	if got["truncated"] != false {
 		t.Fatal("小文件不应被截断")
+	}
+}
+
+// 截断的一刀不能落在汉字身上：limit 按字节算，一个汉字却是 3 个字节，
+// 直接切片会在结尾留下半个 UTF-8 序列 —— 往后传一路都带着一个 U+FFFD，
+// 看着就像文件坏了，其实是这一刀切歪了。
+func TestFSReadTruncatesOnRuneBoundary(t *testing.T) {
+	root := t.TempDir()
+	p := New(Options{FSRoot: root}, nil)
+	p.Grant(plugin, []string{PermFSRead})
+
+	content := "万物皆插件已经上线了"
+	path := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for n := 1; n <= len(content); n++ {
+		res, rpcErr := p.Dispatch(plugin, "core.fs.read", params(map[string]any{"path": path, "limit": n}))
+		if rpcErr != nil {
+			t.Fatalf("limit=%d 读取失败: %v", n, rpcErr)
+		}
+		got := res.(map[string]any)["content"].(string)
+		if !utf8.ValidString(got) {
+			t.Fatalf("limit=%d 切出了半个汉字: %q", n, got)
+		}
+		if strings.ContainsRune(got, '\uFFFD') {
+			t.Fatalf("limit=%d 出现了替换字符: %q", n, got)
+		}
+	}
+
+	// 两个字正好 6 字节：限额够就不能少给一个字
+	res, rpcErr := p.Dispatch(plugin, "core.fs.read", params(map[string]any{"path": path, "limit": 6}))
+	if rpcErr != nil {
+		t.Fatalf("读取失败: %v", rpcErr)
+	}
+	if got := res.(map[string]any)["content"].(string); got != "万物" {
+		t.Fatalf("limit=6 应读到整整两个字，实际 %q", got)
+	}
+}
+
+// 字节序标记不属于文件内容，Windows 那边留它的习惯很普遍
+func TestFSReadStripsUTF8BOM(t *testing.T) {
+	root := t.TempDir()
+	p := New(Options{FSRoot: root}, nil)
+	p.Grant(plugin, []string{PermFSRead})
+
+	path := filepath.Join(root, "bom.txt")
+	if err := os.WriteFile(path, []byte("\xef\xbb\xbf第一行\n第二行"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, rpcErr := p.Dispatch(plugin, "core.fs.read", params(map[string]any{"path": path}))
+	if rpcErr != nil {
+		t.Fatalf("读取失败: %v", rpcErr)
+	}
+	if got := res.(map[string]any)["content"].(string); got != "第一行\n第二行" {
+		t.Fatalf("应去掉 BOM，实际 %q", got)
+	}
+}
+
+// GB18030 是绝大多数中文 .txt / .csv / .log 的实际编码。
+// 不注明的话按 UTF-8 硬读，一整篇都是 U+FFFD —— 用户看到的就是"一个字都不认识"。
+func TestFSReadGB18030(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("GB18030 的码表由 Windows 提供，其余平台拿不出可靠替代")
+	}
+	root := t.TempDir()
+	p := New(Options{FSRoot: root}, nil)
+	p.Grant(plugin, []string{PermFSRead})
+
+	// "万物皆插件" 的 GB18030 字节
+	data := []byte{0xCD, 0xF2, 0xCE, 0xEF, 0xBD, 0xD4, 0xB2, 0xE5, 0xBC, 0xFE}
+	path := filepath.Join(root, "notes.txt")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	const want = "万物皆插件"
+	for _, enc := range []string{"gb18030", "gbk", "gb2312"} {
+		res, rpcErr := p.Dispatch(plugin, "core.fs.read", params(map[string]any{"path": path, "encoding": enc}))
+		if rpcErr != nil {
+			t.Fatalf("encoding=%s 读取失败: %v", enc, rpcErr)
+		}
+		got := res.(map[string]any)
+		if got["encoding"] != "gb18030" {
+			t.Fatalf("应标注实际的解码方式: %v", got)
+		}
+		if got["content"].(string) != want {
+			t.Fatalf("encoding=%s 解码错误，实际 %q，期望 %q", enc, got["content"], want)
+		}
+	}
+}
+
+// 中文路径 / 中文文件名 / 中文内容在能力层要全通。
+// 工作区插件的"设一个中文文件夹当工作区"最终都落到这些能力上，
+// 任何一环把非 ASCII 处理坏了，用户看到的就是"汉字文件夹不能用"。
+func TestFSChinesePathsEndToEnd(t *testing.T) {
+	root := t.TempDir()
+	p := New(Options{FSRoot: root}, nil)
+	p.Grant(plugin, []string{PermFSRead, PermFSWrite, PermFSDelete})
+
+	dir := filepath.Join(root, "中文目录")
+	if _, rpcErr := p.Dispatch(plugin, "core.fs.mkdir", params(map[string]any{"path": dir, "recursive": true})); rpcErr != nil {
+		t.Fatalf("建中文目录失败: %v", rpcErr)
+	}
+
+	file := filepath.Join(dir, "笔记.txt")
+	res, rpcErr := p.Dispatch(plugin, "core.fs.write", params(map[string]any{"path": file, "content": "第一行\n第二行"}))
+	if rpcErr != nil {
+		t.Fatalf("写中文路径失败: %v", rpcErr)
+	}
+	if res.(map[string]any)["path"] != file {
+		t.Fatalf("写回路径不一致: %v", res)
+	}
+
+	// 列中文目录：文件名必须原样是中文
+	res, rpcErr = p.Dispatch(plugin, "core.fs.list", params(map[string]any{"path": dir}))
+	if rpcErr != nil {
+		t.Fatalf("列中文目录失败: %v", rpcErr)
+	}
+	entries := res.(map[string]any)["entries"].([]map[string]any)
+	if len(entries) != 1 || entries[0]["name"] != "笔记.txt" {
+		t.Fatalf("中文文件名未原样返回: %v", entries)
+	}
+
+	// 读中文内容
+	res, rpcErr = p.Dispatch(plugin, "core.fs.read", params(map[string]any{"path": file}))
+	if rpcErr != nil {
+		t.Fatalf("读中文路径失败: %v", rpcErr)
+	}
+	if got := res.(map[string]any)["content"].(string); got != "第一行\n第二行" {
+		t.Fatalf("中文内容不一致: %q", got)
+	}
+
+	// 移动（改名）成另一个中文名
+	dst := filepath.Join(dir, "改名.txt")
+	if _, rpcErr = p.Dispatch(plugin, "core.fs.move", params(map[string]any{"from": file, "to": dst})); rpcErr != nil {
+		t.Fatalf("中文改名失败: %v", rpcErr)
+	}
+
+	// 删除
+	if _, rpcErr = p.Dispatch(plugin, "core.fs.delete", params(map[string]any{"path": dst})); rpcErr != nil {
+		t.Fatalf("删除中文文件失败: %v", rpcErr)
 	}
 }
 

@@ -263,6 +263,14 @@ func (c *Context) ShellOpen(path string) (json.RawMessage, error) {
 	return c.Capability("core.shell.open", map[string]any{"path": path})
 }
 
+// PickFolder 弹系统文件夹选择对话框（需 shell:pickfolder），
+// 返回 {path, cancelled}。用户取消时 path 为空、cancelled 为 true。
+//
+// 这是阻塞调用：对话框不关它就不返回。仅 Windows 支持。
+func (c *Context) PickFolder(initial, title string) (json.RawMessage, error) {
+	return c.Capability("core.shell.pickfolder", map[string]any{"initial": initial, "title": title})
+}
+
 // FSWriteBytes 按 base64 写二进制文件（需 filesystem:write），返回 {path,size}。
 //
 // 写图片、压缩包这类内容必须用它：FSWrite 会把内容当字符串写下去，

@@ -326,7 +326,7 @@ func TestPanelDetailShowsManifest(t *testing.T) {
 
 	// 服务没人在提供时要标 ✗，而不是含糊地说"运行中"
 	api.live = map[string]bool{}
-	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "reload"})
+	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "reload"})
 	res = pmRender(m, 100, 30, 0)
 	if !strings.Contains(pmText(res), "✗ ui.v1") {
 		t.Fatalf("没人提供时应标 ✗：\n%s", pmText(res))
@@ -344,6 +344,40 @@ func TestPanelWideIsTwoColumn(t *testing.T) {
 	}
 	if strings.Contains(narrow, "│") {
 		t.Fatalf("窄屏不该分栏：\n%s", narrow)
+	}
+}
+
+// 宽屏两栏并排时，详情区的热区不能还落在左栏列表的列上。
+//
+// 这是用户报过的真实 bug：detailLines 里的按钮按「从第 0 列开始」登记绝对坐标，
+// 两栏并排后文本是顺序追加的所以位置对，热区却还留在列表那一列 —— 禁用/启用、
+// 删除按钮"看得见、点不中"。
+func TestPanelWideDetailHitsAreShifted(t *testing.T) {
+	m, _ := seedManager(t)
+	pmRender(m, 100, 30, 0)
+	pmPick(t, m, "com.official.demo") // demo 当前启用，详情里会有「禁用」按钮
+	res := pmRender(m, 100, 30, 0)
+
+	rightStart := pmListW + 2
+
+	foundToggle := false
+	for i := range res.Hits {
+		h := &res.Hits[i]
+		switch {
+		case h.Action == "btn" && h.Arg == "toggle":
+			foundToggle = true
+			if h.X < rightStart {
+				t.Fatalf("详情区「禁用/启用」热区 x=%d 还落在列表（应 >= %d）", h.X, rightStart)
+			}
+		case h.Action == "pick":
+			// 列表的 pick 热区必须整个待在左栏，不许越到详情
+			if h.X+h.W > pmListW {
+				t.Fatalf("列表 pick 热区越界到详情：%+v", h)
+			}
+		}
+	}
+	if !foundToggle {
+		t.Fatal("应有「禁用/启用」按钮的热区")
 	}
 }
 
@@ -366,7 +400,7 @@ func TestPanelUnreadableIsRefused(t *testing.T) {
 	}
 	// 就算动作照样发过来（比如手快点到别处），业务那一层也必须挡住：
 	// 界面不给入口是第一道，scan/setEnabled 自己的校验是第二道。
-	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "toggle"})
+	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "toggle"})
 	if !strings.Contains(note, "拒绝启停") {
 		t.Fatalf("应如实说明被拒绝的原因，实际 %q", note)
 	}
@@ -397,7 +431,7 @@ func TestPanelToggleRenamesDirectory(t *testing.T) {
 	api.events = nil
 
 	pmPick(t, m, "com.official.demo")
-	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "toggle"})
+	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "toggle"})
 
 	if len(api.moved) != 1 {
 		t.Fatalf("应发生一次改名，实际 %v", api.moved)
@@ -425,7 +459,7 @@ func TestPanelDeleteShowsPlanThenRemoves(t *testing.T) {
 	// 选中 workbench：demo 在消费 ui.v1，删它应该给出警告
 	pmPick(t, m, "com.official.workbench")
 
-	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "del"})
+	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "del"})
 	if !m.panel.confirmDel {
 		t.Fatal("第一次点应进入确认态")
 	}
@@ -442,7 +476,7 @@ func TestPanelDeleteShowsPlanThenRemoves(t *testing.T) {
 		t.Fatal("第一次点不该真的删")
 	}
 
-	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "del"})
+	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "del"})
 	if len(api.gone) != 3 {
 		t.Fatalf("应删掉目录 + 配置 + 日志三项，实际 %v", api.gone)
 	}
@@ -457,7 +491,7 @@ func TestPanelDeleteShowsPlanThenRemoves(t *testing.T) {
 func TestPanelDeleteConfirmCanBeCancelled(t *testing.T) {
 	m, api := seedManager(t)
 	pmRender(m, 100, 30, 0)
-	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "del"})
+	m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "del"})
 	if !m.panel.confirmDel {
 		t.Fatal("应进入确认态")
 	}
@@ -484,7 +518,7 @@ func TestPanelReloadPicksUpNewPlugin(t *testing.T) {
 	api.tree[filepath.Join(m.root, "plugins")] = append(
 		api.tree[filepath.Join(m.root, "plugins")], entry{Name: "fresh.plugin", Dir: true})
 
-	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "reload"})
+	note := m.panel.action(m, plugin.PanelRequest{Panel: panelID, Action: "btn", Arg: "reload"})
 	if len(m.panel.items) != before+1 {
 		t.Fatalf("重新扫描应看到新插件，实际 %d → %d", before, len(m.panel.items))
 	}

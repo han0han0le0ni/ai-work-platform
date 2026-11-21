@@ -85,6 +85,11 @@ const (
 // rpBtnCount 是顶栏按钮的个数。
 const rpBtnCount = 6
 
+// rpCardBtns 是"管这张卡"的按钮个数：前这些是编辑 / 启停 / 删除，
+// 后面的是"拿它去用"（预览提示词、用开场白起头）。画的时候据此分成两行，
+// primary 强调色也据此定。
+const rpCardBtns = 4
+
 // rpPanel 是这一页的全部界面状态。
 //
 // 它整个住在插件进程里：UI 插件那边只有一个借来的矩形和一串转过来的事件。
@@ -315,16 +320,6 @@ func (p *rpPanel) markDirty(i int) {
 	}
 }
 
-// focusedIndex 返回当前聚焦字段的下标（不在字段上时 -1）。
-func (p *rpPanel) focusedIndex() int {
-	for i := range p.fields {
-		if p.ctlIsField(i) {
-			return i
-		}
-	}
-	return -1
-}
-
 // cardValues 把表单里的内容收成一张卡要提交的那几项。
 func (p *rpPanel) cardValues() map[string]any {
 	return map[string]any{
@@ -413,7 +408,7 @@ func (p *rpPanel) drawHeader(b *plugin.Block, w int) {
 	row := 2
 	x := 1
 	for i, btn := range btns {
-		if i == 4 { // 前四个管这张卡，后两个是"拿它去用"
+		if i == rpCardBtns { // 前一半管这张卡，后一半"拿它去用"
 			row, x = 3, 1
 		}
 		x = p.drawButton(b, row, x, w, i, btn)
@@ -483,7 +478,7 @@ func (p *rpPanel) drawButton(b *plugin.Block, y, x, w, k int, btn rpButton) int 
 		b.Hit(y, x, bw, "btn", btn.action)
 		return x + bw + 2
 	}
-	return b.Button(y, x, btn.label, "btn", btn.action, k < 4)
+	return b.Button(y, x, btn.label, "btn", btn.action, k < rpCardBtns)
 }
 
 // contentEntries 建内容区：列表 → 角色卡字段 → 链路 → 我的身份 → 反馈。
@@ -609,13 +604,19 @@ func (p *rpPanel) drawListItem(b *plugin.Block, y, w, idx int) {
 	if c.Updated != "" {
 		tail += " · 更新于 " + shortStamp(c.Updated)
 	}
-	nameW := w - 5 - plugin.DisplayWidth(tail) - 2
-	if nameW < 6 {
-		nameW = 6
+	// 行布局：<空格><mark 2列><name 区><空格><tail>。先按"name 至少 6 列"给
+	// tail 定上限，name 再拿走剩余空间 —— 这样 tail 很长时 name 也不会被压到
+	// 放不下一个字，且整行恰好占满、绝不越界（不再靠 Block 兜底截断）。
+	const leadW = 3 // " " + mark（两列）
+	const minNameW = 6
+	tailText := plugin.Truncate(tail, maxInt(0, w-leadW-minNameW-1))
+	nameW := w - leadW - 1 - plugin.DisplayWidth(tailText)
+	if nameW < minNameW {
+		nameW = minNameW
 	}
 	b.At(y).Text(style, " "+mark)
 	b.At(y).Text(style, plugin.Pad(plugin.Truncate(c.Name, nameW), nameW))
-	b.At(y).Text(plugin.SDim, " "+plugin.Truncate(tail, maxInt(0, w-5)))
+	b.At(y).Text(plugin.SDim, " "+tailText)
 	b.Hit(y, 0, w, "list", strconv.Itoa(idx))
 }
 
@@ -799,18 +800,18 @@ func (p *rpPanel) key(r *Roleplay, kind, text string) (string, bool) {
 
 	switch kind {
 	case "rune":
-		f := p.focusedField()
+		i, f := p.focusedField()
 		if f == nil {
 			return "", false
 		}
 		for _, ch := range text {
 			f.f.Insert(ch)
 		}
-		p.markDirty(p.focusedIndex())
+		p.markDirty(i)
 		p.say(r, "", true)
 
 	case "backspace", "delete", "left", "right", "home", "end":
-		f := p.focusedField()
+		i, f := p.focusedField()
 		if f == nil {
 			return "", false
 		}
@@ -828,7 +829,7 @@ func (p *rpPanel) key(r *Roleplay, kind, text string) (string, bool) {
 		case "end":
 			f.f.End()
 		}
-		p.markDirty(p.focusedIndex())
+		p.markDirty(i)
 		p.say(r, "", true)
 
 	case "up":
@@ -871,13 +872,13 @@ func (p *rpPanel) press(r *Roleplay, action string) string {
 			return p.say(r, "新建失败："+err.Error(), false)
 		}
 		id, _ := out["id"].(string)
-		p.loadedID = "" // 强制把新卡灌进表单
-		p.load(r)
+		p.load(r) // 刷新列表，拿到新卡的下标
 		for i, c := range p.items {
 			if c.ID == id {
 				p.sel = i
 			}
 		}
+		p.loadedID = "" // 让下一次 load 强制把新卡灌进表单（只灌这一次，不再多灌一张旧卡）
 		p.load(r)
 		p.setFocus(p.ringField(rpFieldName))
 		return p.say(r, noteOr(out, "已新建角色卡"), true)
@@ -1004,14 +1005,17 @@ func (p *rpPanel) ctlIsField(i int) bool {
 	return p.focus == p.ringField(i)
 }
 
-// focusedField 返回当前聚焦的字段；焦点不在字段上时返回 nil。
-func (p *rpPanel) focusedField() *rpField {
+// focusedField 返回当前聚焦字段的下标与指针；焦点不在字段上时返回 (-1, nil)。
+//
+// 下标与指针一次遍历都拿到 —— 按键处理既要改字段内容（要指针），
+// 又要记"这个字段被改过了"（要下标），分两趟遍历纯属浪费。
+func (p *rpPanel) focusedField() (int, *rpField) {
 	for i := range p.fields {
 		if p.ctlIsField(i) {
-			return &p.fields[i]
+			return i, &p.fields[i]
 		}
 	}
-	return nil
+	return -1, nil
 }
 
 // moveFocus 上下移一格；落到列表项上就顺手把那个人选过来（换人 = 换表单）。

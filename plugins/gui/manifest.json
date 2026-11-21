@@ -1,0 +1,15 @@
+{
+  "id": "com.official.gui",
+  "name": "Native GUI",
+  "description": "原生桌面界面：Gio 自绘的中文暗色三栏工作台，替代终端与浏览器界面。核心零改动，直接调 conversation/agent 等插件服务",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["gui.v1"],
+  "consumes": ["conversation.v1", "session.v1", "agent.v1", "llm.v1", "toolExecutor.v1", "pluginManager.v1"],
+  "permissions": ["shell:pickfolder"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-work-platform · 万物皆插件的 AI 工作台</title>
+<meta name="description" content="一个不会编程的人，闲着无聊，用 AI 做出来的插件化 AI 工作平台。">
+<style>
+  :root{
+    --bg:#141413; --bg2:#1c1b19; --panel:#201f1d;
+    --ink:#faf9f5; --ink2:#b0aea5; --ink3:#8a877e;
+    --line:rgba(250,249,245,.09);
+    --acc:#d97757; --acc2:#6a9bcc; --acc3:#788c5d;
+    --radius:22px;
+    --font-head:"Outfit","PingFang SC","Microsoft YaHei",sans-serif;
+    --font-mono:"Cascadia Code",Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:var(--font-head);font-size:16px;line-height:1.75;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  ::selection{background:var(--acc);color:#141413}
+  .wrap{max-width:1200px;margin:0 auto;padding:0 28px}
+  section{padding:104px 0}
+  .kicker{display:inline-flex;align-items:center;gap:10px;font-size:12px;letter-spacing:.22em;text-transform:uppercase;color:var(--acc);font-weight:600}
+  .kicker::before{content:"";width:26px;height:1px;background:var(--acc)}
+  h2{font-size:clamp(30px,4.2vw,46px);font-weight:700;letter-spacing:-.02em;line-height:1.15;margin:16px 0 14px}
+  .lead{color:var(--ink2);max-width:62ch;font-size:17px}
+  .lead b{color:var(--ink);font-weight:600}
+  .reveal{opacity:0;transform:translateY(26px);transition:opacity .8s cubic-bezier(.16,1,.3,1),transform .8s cubic-bezier(.16,1,.3,1)}
+  .reveal.in{opacity:1;transform:none}
+  code.inline{font-family:var(--font-mono);font-size:13.5px;background:rgba(250,249,245,.07);padding:2px 8px;border-radius:6px}
+
+  nav{position:fixed;top:0;left:0;right:0;z-index:50;backdrop-filter:blur(14px);background:rgba(20,20,19,.72);border-bottom:1px solid var(--line)}
+  .nav-inner{max-width:1200px;margin:0 auto;padding:13px 28px;display:flex;align-items:center;justify-content:space-between}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;text-decoration:none;color:var(--ink)}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--acc);box-shadow:0 0 0 0 rgba(217,119,87,.6);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(217,119,87,.55)}70%{box-shadow:0 0 0 12px rgba(217,119,87,0)}100%{box-shadow:0 0 0 0 rgba(217,119,87,0)}}
+  .nav-links{display:flex;gap:26px;align-items:center}
+  .nav-links a{color:var(--ink2);text-decoration:none;font-size:14px;transition:color .2s}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-cta{background:var(--acc);color:#141413;padding:8px 18px;border-radius:99px;font-weight:600}
+  .nav-cta:hover{background:#e58a6b;color:#141413}
+  @media(max-width:760px){.nav-links a:not(.nav-cta){display:none}}
+
+  .hero{position:relative;min-height:100dvh;display:flex;align-items:center;padding:120px 0 90px;overflow:hidden}
+  #net{position:absolute;inset:0;width:100%;height:100%}
+  .hero .wrap{position:relative;z-index:2;display:grid;grid-template-columns:1.1fr .9fr;gap:56px;align-items:center;width:100%}
+  @media(max-width:900px){.hero .wrap{grid-template-columns:1fr;gap:40px}}
+  .repo-pill{display:inline-flex;align-items:center;gap:10px;padding:8px 16px;border-radius:99px;border:1px solid var(--line);background:rgba(250,249,245,.04);font-size:13px;color:var(--ink2);text-decoration:none;transition:border-color .2s,color .2s}
+  .repo-pill:hover{border-color:rgba(217,119,87,.5);color:var(--ink)}
+  .repo-pill svg{width:15px;height:15px;fill:currentColor;flex:none}
+  h1{font-weight:800;font-size:clamp(42px,6.4vw,76px);line-height:1.06;letter-spacing:-.035em;margin:26px 0 8px}
+  h1 .cn{display:block;font-size:.5em;font-weight:600;letter-spacing:.1em;color:var(--ink2);margin-top:14px}
+  h1 .glow{color:var(--acc)}
+  .hero-sub{color:var(--ink2);font-size:17.5px;max-width:56ch;margin:20px 0 32px}
+  .hero-sub b{color:var(--ink);font-weight:600}
+  .hero-actions{display:flex;gap:14px;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:9px;padding:13px 25px;border-radius:99px;font-weight:600;font-size:15px;text-decoration:none;transition:transform .15s,background .2s,border-color .2s}
+  .btn:active{transform:scale(.97)}
+  .btn-primary{background:var(--acc);color:#141413}
+  .btn-primary:hover{background:#e58a6b}
+  .btn-ghost{border:1px solid var(--line);color:var(--ink)}
+  .btn-ghost:hover{border-color:rgba(250,249,245,.3)}
+  .btn svg{width:16px;height:16px;fill:currentColor}
+  .hero-card{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(160deg,rgba(250,249,245,.05),rgba(250,249,245,.015));padding:24px;box-shadow:inset 0 1px 0 rgba(255,255,255,.06);font-family:var(--font-mono);font-size:13px;line-height:1.9;color:var(--ink2)}
+  .hero-card .bar{display:flex;gap:7px;margin-bottom:15px}
+  .hero-card .bar i{width:10px;height:10px;border-radius:50%}
+  .hero-card .c1{background:#e0655a}.hero-card .c2{background:#e0b04e}.hero-card .c3{background:#7fb069}
+  .hero-card .k{color:var(--acc2)}.hero-card .s{color:var(--ink3)}.hero-card .ok{color:var(--acc)}
+  .scroll-hint{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);color:var(--ink3);font-size:11px;letter-spacing:.24em;z-index:2}
+  .scroll-hint::after{content:"";display:block;width:1px;height:34px;margin:8px auto 0;background:linear-gradient(var(--ink3),transparent);animation:drip 1.8s infinite}
+  @keyframes drip{0%{transform:scaleY(0);transform-origin:top}55%{transform:scaleY(1);transform-origin:top}56%{transform-origin:bottom}100%{transform:scaleY(0);transform-origin:bottom}}
+
+  .truth{background:var(--bg2);border-block:1px solid var(--line)}
+  .truth-grid{display:grid;grid-template-columns:1fr 1fr;gap:52px;align-items:center}
+  @media(max-width:880px){.truth-grid{grid-template-columns:1fr;gap:34px}}
+  .truth blockquote{border-left:3px solid var(--acc);padding:6px 0 6px 26px;margin-top:26px;font-size:clamp(21px,2.6vw,27px);font-weight:600;line-height:1.5;letter-spacing:-.01em}
+  .truth blockquote em{font-style:normal;color:var(--acc)}
+  .truth-side{display:flex;flex-direction:column;gap:14px}
+  .truth-item{display:flex;gap:14px;padding:17px 20px;border:1px solid var(--line);border-radius:16px;background:rgba(250,249,245,.02)}
+  .truth-item .num{font-family:var(--font-mono);color:var(--acc);font-weight:700;flex:none;padding-top:2px}
+  .truth-item h4{font-size:15.5px;font-weight:600;margin-bottom:3px}
+  .truth-item p{font-size:14px;color:var(--ink2)}
+
+  .feat{display:grid;grid-template-columns:1fr 1fr;gap:26px;margin-top:46px}
+  @media(max-width:880px){.feat{grid-template-columns:1fr}}
+  .feat-card{position:relative;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:32px;transition:transform .35s cubic-bezier(.16,1,.3,1),border-color .3s}
+  .feat-card:hover{transform:translateY(-6px);border-color:rgba(217,119,87,.4)}
+  .feat-card .tag{position:absolute;top:0;right:0;background:rgba(217,119,87,.12);color:var(--acc);font-family:var(--font-mono);font-size:12px;padding:8px 16px;border-bottom-left-radius:14px;font-weight:600}
+  .feat-card h3{font-size:22px;font-weight:700;margin:12px 0 10px;letter-spacing:-.01em}
+  .feat-card p{color:var(--ink2);font-size:15px}
+  .feat-card ul{list-style:none;margin-top:16px;display:flex;flex-direction:column;gap:9px}
+  .feat-card li{display:flex;gap:10px;font-size:14px;color:var(--ink2)}
+  .feat-card li::before{content:"›";color:var(--acc);font-weight:700;flex:none}
+  .feat-card .result{margin-top:20px;padding:13px 17px;border-radius:14px;background:rgba(120,140,93,.12);border:1px solid rgba(120,140,93,.3);font-size:13.5px;color:#c9d6b8}
+  .feat-card .result b{color:var(--acc3)}
+  .feat-card.orange:hover{border-color:rgba(106,155,204,.4)}
+  .feat-card.orange .tag{background:rgba(106,155,204,.12);color:var(--acc2)}
+  .feat-card.orange li::before{color:var(--acc2)}
+
+  .stats{background:var(--bg2);border-block:1px solid var(--line)}
+  .stat-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin-top:44px}
+  @media(max-width:980px){.stat-grid{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.stat-grid{grid-template-columns:repeat(2,1fr)}}
+  .stat{background:var(--bg2);padding:28px 16px;text-align:center;transition:background .3s}
+  .stat:hover{background:var(--panel)}
+  .stat .v{font-size:clamp(25px,3vw,36px);font-weight:800;letter-spacing:-.02em}
+  .stat .l{font-size:12.5px;color:var(--ink3);margin-top:6px;letter-spacing:.06em}
+
+  .pgroups{display:flex;flex-direction:column;gap:26px;margin-top:44px}
+  .pgroup{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:26px 28px}
+  .pgroup h3{font-size:17px;font-weight:700;margin-bottom:4px}
+  .pgroup h3 .en{font-family:var(--font-mono);font-size:12px;color:var(--acc);margin-left:10px;letter-spacing:.08em}
+  .pgroup .desc{font-size:14px;color:var(--ink3);margin-bottom:16px}
+  .chips{display:flex;flex-wrap:wrap;gap:10px}
+  .chip{padding:8px 16px;border-radius:99px;border:1px solid var(--line);font-size:13.5px;color:var(--ink2);background:rgba(250,249,245,.03);transition:all .25s;font-family:var(--font-mono)}
+  .chip:hover{color:var(--ink);border-color:rgba(217,119,87,.45);transform:translateY(-2px)}
+  .chip b{color:var(--acc);font-weight:600}
+
+  .tl{position:relative;margin-top:52px;padding-left:34px}
+  .tl::before{content:"";position:absolute;left:8px;top:6px;bottom:6px;width:2px;background:linear-gradient(var(--acc),rgba(217,119,87,.15))}
+  .tl-item{position:relative;padding-bottom:40px}
+  .tl-item:last-child{padding-bottom:0}
+  .tl-item::before{content:"";position:absolute;left:-33px;top:7px;width:12px;height:12px;border-radius:50%;background:var(--bg);border:3px solid var(--acc);box-shadow:0 0 0 4px rgba(217,119,87,.12)}
+  .tl-item .ph{font-family:var(--font-mono);font-size:12px;color:var(--acc);letter-spacing:.14em;text-transform:uppercase}
+  .tl-item h3{font-size:20px;font-weight:700;margin:7px 0 6px}
+  .tl-item p{color:var(--ink2);font-size:15px;max-width:64ch}
+  .tl-item p b{color:var(--ink);font-weight:600}
+
+  .cta{position:relative;text-align:center;padding:126px 0 116px;overflow:hidden}
+  .cta h2{font-size:clamp(32px,4.6vw,52px)}
+  .cta .lead{margin:0 auto 36px}
+  .cta .glowline{position:absolute;left:50%;top:0;transform:translateX(-50%);width:60%;height:1px;background:linear-gradient(90deg,transparent,rgba(217,119,87,.7),transparent)}
+
+  footer{border-top:1px solid var(--line);padding:32px 0;color:var(--ink3);font-size:13px}
+  .foot{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+  footer a{color:var(--ink2);text-decoration:none}
+  footer a:hover{color:var(--acc)}
+
+  @media(prefers-reduced-motion:reduce){
+    *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}
+    html{scroll-behavior:auto}.reveal{opacity:1;transform:none}
+  }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <a class="brand" href="#top"><span class="dot"></span>ai-work-platform</a>
+    <div class="nav-links">
+      <a href="#truth">这是啥</a>
+      <a href="#kernel">微内核</a>
+      <a href="#plugins">插件墙</a>
+      <a class="nav-cta" href="https://github.com/han0han0le0ni/ai-work-platform" target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <canvas id="net" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <div>
+      <a class="repo-pill" href="https://github.com/han0han0le0ni/ai-work-platform" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        han0han0le0ni / ai-work-platform · Go
+      </a>
+      <h1>Everything is a<br><span class="glow">plugin</span><span class="cn">万物皆插件的 AI 工作台</span></h1>
+      <p class="hero-sub">
+        一个极简微内核：它不认识 AI、不认识 LLM、不认识界面，只认识 <b>JSON-RPC</b> 和
+        <b>manifest.json</b>。聊天、文件、画图、识图、角色扮演——全是插件。
+      </p>
+      <p class="hero-sub" style="margin-top:14px">
+        这个仓库里<b>没有任何一行代码是我亲手写的</b>——我不会编程，全部代码由 AI 编写。
+        我的想法，加上 AI 的代码，加上几个闲着无聊的下午，就有了它。
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="https://github.com/han0han0le0ni/ai-work-platform" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          去仓库看看
+        </a>
+        <a class="btn btn-ghost" href="#truth">先说清楚这是啥</a>
+      </div>
+    </div>
+    <div class="hero-card" aria-hidden="true">
+      <div class="bar"><i class="c1"></i><i class="c2"></i><i class="c3"></i></div>
+      <div><span class="k">$</span> 这个平台是怎么运作的？</div>
+      <div>&gt; core: 只认识 JSON-RPC 2.0 + manifest.json</div>
+      <div>&gt; 其余的一切……</div>
+      <div>&gt; 都是插件。</div>
+      <div>&nbsp;</div>
+      <div><span class="k">chat</span>      = <span class="ok">plugin</span> <span class="s">// 聊天</span></div>
+      <div><span class="k">filesystem</span> = <span class="ok">plugin</span> <span class="s">// 文件</span></div>
+      <div><span class="k">imagegen</span>  = <span class="ok">plugin</span> <span class="s">// 画图</span></div>
+      <div><span class="k">roleplay</span>  = <span class="ok">plugin</span> <span class="s">// 角色扮演</span></div>
+      <div><span class="k">ui</span>        = <span class="ok">plugin</span> <span class="s">// 连界面都是</span></div>
+      <div><span class="k">core_lines</span> = <span class="ok">~3700</span> <span class="s">// 微内核就这么大</span></div>
+    </div>
+  </div>
+  <div class="scroll-hint">SCROLL</div>
+</header>
+
+<!-- ================= 坦白 ================= -->
+<section class="truth" id="truth">
+  <div class="wrap truth-grid">
+    <div class="reveal">
+      <span class="kicker">坦白从宽</span>
+      <h2>闲着无聊，让 AI 做了个平台</h2>
+      <p class="lead">
+        这个项目的灵感来自 DSH 的「<b style="color:var(--ink)">万物皆插件</b>」。
+        我被这个想法迷住了：一个足够小的内核，其他一切都是可以插拔的插件。
+        于是我把这个想法丢给了 AI——「我们能不能自己也做一个？」。
+        我不会编程，<b style="color:var(--ink)">从内核到插件、从界面到 SDK，所有代码都是 AI 写的</b>；
+        我负责提需求、挑毛病、点确认，外加提供「闲着无聊」这件事本身。
+      </p>
+      <blockquote>
+        仓库描述写得明明白白：<br><em>「自己闲着无聊用 AI 做着玩的」</em>
+      </blockquote>
+    </div>
+    <div class="truth-side">
+      <div class="truth-item reveal">
+        <div class="num">01</div>
+        <div>
+          <h4>一个想法，聊成一个平台</h4>
+          <p>从「内核应该有多小」聊到聊天、画图、识图、角色扮演全部插件化——17 个官方插件就是这么一句一句聊出来的。</p>
+        </div>
+      </div>
+      <div class="truth-item reveal">
+        <div class="num">02</div>
+        <div>
+          <h4>规则先行，代码跟上</h4>
+          <p>先定「公开契约只增不减」「源码树不放构建产物」这些规矩，再让 AI 按规矩实现——外行管不住代码，但管得住原则。</p>
+        </div>
+      </div>
+      <div class="truth-item reveal">
+        <div class="num">03</div>
+        <div>
+          <h4>老实承认没做完</h4>
+          <p>README 里专门写了「尚未实现」和「已知取舍」章节：插件市场、Wasm 沙箱、包签名验证都还没做。诚实比好看重要。</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 微内核 ================= -->
+<section id="kernel">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="kicker">设计哲学</span>
+      <h2>内核很小，野心很大</h2>
+      <p class="lead">
+        核心只做三件事：加载插件、管理生命周期、格式化兜底。约 <b>3700 行</b> Go 代码，
+        十个子模块，通过 <code class="inline">JSON-RPC over stdio</code> 与插件通信。
+        它不认识 AI、LLM、工具、UI——只认识 JSON-RPC 2.0 和 manifest.json。
+      </p>
+    </div>
+    <div class="feat">
+      <div class="feat-card reveal">
+        <span class="tag">capability</span>
+        <h3>能力代理：默认拒绝</h3>
+        <p>插件想读文件、发网络请求、开终端？必须在 manifest 里声明权限，否则一律拒绝（-32002）。配合路径围栏、审计日志、4MB 输出上限——AI 再能折腾，也出不了沙箱。</p>
+        <ul>
+          <li>core.fs / core.net / core.shell / core.process 四族能力</li>
+          <li>未声明权限 → 默认拒绝；路径围栏限制访问范围</li>
+          <li>每个动作都留审计日志</li>
+        </ul>
+        <div class="result"><b>原则：</b>插件只有「借地方」的权利，用户永远有退路。</div>
+      </div>
+      <div class="feat-card orange reveal">
+        <span class="tag">ui.page.*</span>
+        <h3>插件自带界面</h3>
+        <p>插件在 manifest 里声明 <code class="inline">ui.page.&lt;名字&gt;.v1</code>，实现 list / render / action / key 四个方法，就能拥有自己的页面。界面只负责「借地方」、转发点击与按键——Tab 键永远不转给插件。</p>
+        <ul>
+          <li>全屏 TUI + 行式降级两档自动选择，不依赖浏览器</li>
+          <li>16 种终端尺寸/颜色组合用单测校验排版不变量</li>
+          <li>插件没了，它的页面就没了——干净退场</li>
+        </ul>
+        <div class="result"><b>细节：</b>每行显示宽度精确等于终端宽度，一像素都不多。</div>
+      </div>
+      <div class="feat-card orange reveal">
+        <span class="tag">ai-pipeline</span>
+        <h3>AI 四件套链路</h3>
+        <p>llm → toolExecutor → agent → session，四个插件串出完整的 AI 对话链路：界面 → session → agent → 工具执行 → 大模型 → 文件读取 → 能力代理。零配置可跑（离线 mock），支持 DeepSeek、Kimi、GLM、OpenAI、Gemini 等十余家云端 + Ollama/LM Studio 本机服务。</p>
+        <ul>
+          <li>provider 协议跟着端点走：OpenAI 兼容 / Ollama 原生 / mock</li>
+          <li>/tool 命令逐层自省，实时看 AI 在调什么工具</li>
+          <li>三个刻意取舍：缺插件不崩、预算可自定义、错误喂回模型</li>
+        </ul>
+        <div class="result"><b>亮点：</b>AI 不只是被使用——它还能自己给自己写插件。</div>
+      </div>
+      <div class="feat-card reveal">
+        <span class="tag">pluginManager</span>
+        <h3>让 AI 自己做插件</h3>
+        <p>一条命令 <code class="inline">/tool pluginManager.v1 create</code>，AI 就能生成一个带 manifest、入口和界面的完整插件（Python 直接可用，Go 经 builder 编译）。builder 有严格安全边界：只执行写死的 <code class="inline">go build</code>，拒绝路径穿越。</p>
+        <ul>
+          <li>插件支持 binary / python / node / java / wasm 五种运行时</li>
+          <li>生命周期状态机：pending → starting → active → degraded → dead</li>
+          <li>4 种语言官方 SDK：Go / Python / Java / C</li>
+        </ul>
+        <div class="result"><b>闭环：</b>用 AI 做的平台，最终由 AI 自己扩展它。</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 数字 ================= -->
+<section class="stats" id="stats">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="kicker">数字会说话</span>
+      <h2>「做着玩」玩出来的体量</h2>
+    </div>
+    <div class="stat-grid reveal">
+      <div class="stat"><div class="v" data-count="17">0</div><div class="l">官方插件</div></div>
+      <div class="stat"><div class="v" data-count="593">0</div><div class="l">Go 源码文件</div></div>
+      <div class="stat"><div class="v" data-count="163310" data-plus="+">0</div><div class="l">行 Go 代码</div></div>
+      <div class="stat"><div class="v" data-count="4">0</div><div class="l">语言 SDK</div></div>
+      <div class="stat"><div class="v" data-count="10">0</div><div class="l">内核子模块</div></div>
+      <div class="stat"><div class="v" data-count="5">0</div><div class="l">插件运行时</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 插件墙 ================= -->
+<section id="plugins">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="kicker">万物皆插件</span>
+      <h2>17 个官方插件，各管各的</h2>
+      <p class="lead">从 AI 对话到画 SVG，从文件管理到用量监控——每一个都是可独立卸载的插件。</p>
+    </div>
+    <div class="pgroups">
+      <div class="pgroup reveal">
+        <h3>AI 大脑<span class="en">AI PIPELINE</span></h3>
+        <div class="desc">四件套串起完整对话链路：模型 → 工具执行 → 智能体 → 会话</div>
+        <div class="chips">
+          <span class="chip"><b>llm</b> · 多端点模型接入</span>
+          <span class="chip"><b>tool-executor</b> · 工具调用循环</span>
+          <span class="chip"><b>agent</b> · 任务规划执行</span>
+          <span class="chip"><b>session</b> · 会话管理</span>
+          <span class="chip"><b>conversation</b> · 对话历史</span>
+        </div>
+      </div>
+      <div class="pgroup reveal">
+        <h3>门面担当<span class="en">INTERFACE</span></h3>
+        <div class="desc">保底界面也是插件：终端 TUI，不启动 HTTP 服务、不开浏览器</div>
+        <div class="chips">
+          <span class="chip"><b>workbench</b> · 终端工作台</span>
+          <span class="chip"><b>minimal-ui</b> · 行式降级界面</span>
+          <span class="chip"><b>webui</b> · 网页界面</span>
+          <span class="chip"><b>aurora</b> · 主题外观</span>
+        </div>
+      </div>
+      <div class="pgroup reveal">
+        <h3>动手能力<span class="en">TOOLING</span></h3>
+        <div class="desc">文件、工作区、插件自身的管理——全走能力代理的权限与审计</div>
+        <div class="chips">
+          <span class="chip"><b>fs-tool</b> · 基础文件工具</span>
+          <span class="chip"><b>workspace</b> · 工作区全套操作</span>
+          <span class="chip"><b>plugin-manager</b> · 安装/卸载/热更新</span>
+          <span class="chip"><b>builder</b> · AI 自制插件编译器</span>
+        </div>
+      </div>
+      <div class="pgroup reveal">
+        <h3>创意玩家<span class="en">CREATIVE</span></h3>
+        <div class="desc">模型自己写 SVG 就能画图；角色扮演让 AI 记住你的设定</div>
+        <div class="chips">
+          <span class="chip"><b>svgdraw</b> · 文本画图（纯 SVG）</span>
+          <span class="chip"><b>imagegen</b> · 外接图像生成</span>
+          <span class="chip"><b>roleplay</b> · 角色卡 / 记忆 / 身份</span>
+        </div>
+      </div>
+      <div class="pgroup reveal">
+        <h3>精打细算<span class="en">MONITOR</span></h3>
+        <div class="desc">可拖动、可收起的浮窗，token 花在哪一目了然</div>
+        <div class="chips">
+          <span class="chip"><b>usage-monitor</b> · 余额 / token / 缓存命中率</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 上手 ================= -->
+<section class="stats">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="kicker">快速上手</span>
+      <h2>两条命令，跑起来</h2>
+    </div>
+    <div class="pgroups">
+      <div class="pgroup reveal">
+        <h3>Windows<span class="en">BUILD.PS1</span></h3>
+        <div class="chips" style="font-size:14px">
+          <span class="chip">powershell -ExecutionPolicy Bypass -File build.ps1</span>
+          <span class="chip">.\runtime\core\启动AI工作平台.exe</span>
+        </div>
+        <p class="desc" style="margin-top:14px">构建产物生成 <b style="color:var(--ink2)">启动AI工作平台.exe</b>，启动后由 workbench 接管终端，零配置可用离线 mock 模式先跑起来。</p>
+      </div>
+      <div class="pgroup reveal">
+        <h3>Linux / macOS<span class="en">MAKEFILE</span></h3>
+        <div class="chips" style="font-size:14px">
+          <span class="chip">make build</span>
+          <span class="chip">make test</span>
+          <span class="chip">make clean</span>
+        </div>
+        <p class="desc" style="margin-top:14px">Go 1.27+ 即可编译；发布包用 <code class="inline">tools\pack-release.ps1</code> 打 zip + SHA256，安装包不含任何个人数据。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= CTA ================= -->
+<section class="cta">
+  <div class="glowline"></div>
+  <div class="wrap">
+    <div class="reveal">
+      <span class="kicker" style="justify-content:center;display:flex">写给同样无聊又好奇的人</span>
+      <h2>闲着无聊，也能玩出个平台</h2>
+      <p class="lead" style="margin-inline:auto">
+        灵感是别人的（DSH 的万物皆插件），代码是 AI 写的，
+        我贡献的是需求、挑剔和无数句「不对，再改改」。
+        核心只有三千多行，其余全是插件——包括这段话所在的页面背后，也差点是个插件。
+      </p>
+      <div class="hero-actions" style="justify-content:center">
+        <a class="btn btn-primary" href="https://github.com/han0han0le0ni/ai-work-platform" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+          访问 GitHub 仓库
+        </a>
+        <a class="btn btn-ghost" href="#top">回到顶部</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <div>ai-work-platform · 受 DSH 万物皆插件启发 · 全部代码由 AI 编写</div>
+    <div><a href="https://github.com/han0han0le0ni" target="_blank" rel="noopener">@han0han0le0ni</a> · 人类出点子，AI 写代码</div>
+  </div>
+</footer>
+<script>
+(function(){
+  "use strict";
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ---------- 节点网络背景 ---------- */
+  var cv = document.getElementById("net");
+  var ctx = cv.getContext("2d");
+  var W, H, nodes = [], spikes = [];
+  var COLORS = ["217,119,87", "106,155,204", "176,174,165"];
+
+  function resize(){
+    W = cv.width = cv.offsetWidth * devicePixelRatio;
+    H = cv.height = cv.offsetHeight * devicePixelRatio;
+    var n = Math.min(70, Math.max(28, Math.round(W * H / 42000 / devicePixelRatio)));
+    nodes = [];
+    for (var i = 0; i < n; i++){
+      nodes.push({
+        x: Math.random() * W, y: Math.random() * H,
+        vx: (Math.random() - .5) * .22 * devicePixelRatio,
+        vy: (Math.random() - .5) * .22 * devicePixelRatio,
+        r: (Math.random() * 1.8 + 1.1) * devicePixelRatio,
+        c: COLORS[(Math.random() * COLORS.length) | 0]
+      });
+    }
+  }
+  resize();
+  window.addEventListener("resize", resize);
+
+  var MAX_LINK = 150 * devicePixelRatio;
+  function frame(){
+    ctx.clearRect(0, 0, W, H);
+    var i, j, a, b, dx, dy, d;
+    for (i = 0; i < nodes.length; i++){
+      a = nodes[i];
+      a.x += a.vx; a.y += a.vy;
+      if (a.x < 0 || a.x > W) a.vx *= -1;
+      if (a.y < 0 || a.y > H) a.vy *= -1;
+    }
+    for (i = 0; i < nodes.length; i++){
+      for (j = i + 1; j < nodes.length; j++){
+        a = nodes[i]; b = nodes[j];
+        dx = a.x - b.x; dy = a.y - b.y;
+        d = Math.sqrt(dx * dx + dy * dy);
+        if (d < MAX_LINK){
+          var alpha = (1 - d / MAX_LINK) * .16;
+          ctx.strokeStyle = "rgba(250,249,245," + alpha.toFixed(3) + ")";
+          ctx.lineWidth = devicePixelRatio * .7;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+          if (!reduce && Math.random() < .0016){
+            spikes.push({x: a.x, y: a.y, tx: b.x, ty: b.y, t: 0, c: a.c});
+          }
+        }
+      }
+    }
+    for (i = spikes.length - 1; i >= 0; i--){
+      var s = spikes[i];
+      s.t += .045;
+      if (s.t >= 1){ spikes.splice(i, 1); continue; }
+      var px = s.x + (s.tx - s.x) * s.t;
+      var py = s.y + (s.ty - s.y) * s.t;
+      ctx.beginPath();
+      ctx.arc(px, py, devicePixelRatio * 2.4, 0, 6.284);
+      ctx.fillStyle = "rgba(" + s.c + ",.9)";
+      ctx.fill();
+    }
+    for (i = 0; i < nodes.length; i++){
+      a = nodes[i];
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, a.r, 0, 6.284);
+      ctx.fillStyle = "rgba(" + a.c + ",.75)";
+      ctx.fill();
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  /* ---------- 滚动显现 ---------- */
+  var io = new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if (e.isIntersecting){ e.target.classList.add("in"); io.unobserve(e.target); }
+    });
+  }, {threshold: .12});
+  document.querySelectorAll(".reveal").forEach(function(el, i){
+    el.style.transitionDelay = (i % 4) * 70 + "ms";
+    io.observe(el);
+  });
+
+  /* ---------- 数字滚动 ---------- */
+  function count(el){
+    var target = +el.dataset.count, plus = el.dataset.plus || "", t0 = null;
+    function step(t){
+      if (!t0) t0 = t;
+      var p = Math.min((t - t0) / 1400, 1);
+      var eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(target * eased).toLocaleString("en-US") + plus;
+      if (p < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
+  var so = new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      if (e.isIntersecting){ count(e.target); so.unobserve(e.target); }
+    });
+  }, {threshold: .6});
+  document.querySelectorAll("[data-count]").forEach(function(el){
+    if (reduce){ el.textContent = (+el.dataset.count).toLocaleString("en-US") + (el.dataset.plus || ""); }
+    else so.observe(el);
+  });
+})();
+</script>
+</body>
+</html>

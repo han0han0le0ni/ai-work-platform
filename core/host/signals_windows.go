@@ -12,9 +12,16 @@ import (
 func (h *Host) watchSignals() {
 	ch := make(chan os.Signal, 4)
 	signal.Notify(ch, os.Interrupt)
-	for sig := range ch {
-		h.logs.Core("info", "收到信号 %v：退出", sig)
-		h.Shutdown()
-		return
+	for {
+		select {
+		case sig := <-ch:
+			h.logs.Core("info", "收到信号 %v：退出", sig)
+			h.Shutdown()
+			return
+		case <-h.stopped:
+			// Shutdown 由别的路径触发（core.shutdown 能力 / 重启收尾）：
+			// 不能还堵在信号循环里，否则 Run 永远等不到返回。
+			return
+		}
 	}
 }

@@ -1,5 +1,17 @@
 # AI 工作平台核心
 
+> **作者说明**：这个仓库里没有任何一行代码是我亲手写的——我不会编程，全部代码由 AI 编写。灵感来自 DSH 的「万物皆插件」，我负责提需求、挑毛病、点确认，外加提供「闲着无聊」这件事本身。我唯一能贡献的，是奇思妙想和「再改改」的执拗。
+
+## 先说清楚：这是怎么做出来的
+
+- **想法是我的，代码是 AI 的**：从「内核只认识 JSON-RPC 和 manifest.json」到聊天、画图、识图、角色扮演全部插件化——17 个官方插件、4 种语言 SDK，都是我和 AI 一句一句聊出来的。
+- **我不会编程，但会提要求**：先定「公开契约只增不减」「源码树不放构建产物」这些规矩，再让 AI 按规矩实现。外行管不住代码，但管得住原则。
+- **老实承认没做完**：本文档后面专门写了「尚未实现」和「已知取舍」——插件市场、Wasm 沙箱、包签名验证都还没做。诚实比好看重要。
+
+> 仓库原话：受 DSH 的万物皆插件启发，自己闲着无聊用 AI 做着玩的。
+
+---
+
 > 一个用 JSON-RPC over stdio 加载子进程插件的极简微内核。核心只做加载、生命周期、格式化兜底。其余全部是插件。所有变更重启生效。公开契约只增不减。
 
 核心**不认识** AI、不认识 LLM、不认识工具、不认识 UI。
@@ -706,6 +718,7 @@ return out, nil
 - **路径解析**：绝对路径直接使用；相对路径固定解析到 `fsRoot`（若配置）或运行时目录，**绝不跟随核心进程的当前目录**——那取决于运维怎么启动核心，是不确定行为
 - **审计**：每次能力调用写一行 `logs/core.log`，例如 `能力代理：com.official.fs-tool 调用 core.fs.read E:\...\core.json`
 - **输出上限**：单次调用最多 4 MB，`core.fs.read` 默认最多 1 MB（可用 `limit` 调整）
+- **中文怎么读**：`encoding` 省略时按 UTF-8 读（顺带剥掉 Windows 留下来的字节序标记）；`"gb18030"`（`"gbk"` / `"gb2312"` 亦可）用来读**中文遗留编码**的文本 —— Excel 导出的 CSV、老编辑器存的 `.txt`、国产软件写的日志几乎都是这一族，按 UTF-8 硬读的话每个字都会变成 `U+FFFD`，看着就是"一个字都不认识"。二进制仍然必须走 base64
 - **网络**：只允许 `http` / `https`，只允许 `GET/POST/PUT/PATCH/DELETE/HEAD`
 - **删除与文件锁**：`core.fs.delete` **先整体移进 `pending-delete/` 再删副本**（这一步是原子的）；
   连改名都被拒时**原样保留**并返回错误。绝不做"能删几个删几个"——那会留下一个 manifest 没了、入口还在的残疾目录
@@ -1136,6 +1149,7 @@ Go 骨架用官方 SDK，性能好，但必须有 Go 工具链。
 你 › /tool workspace.v1 write  {"path":"notes/a.txt","content":"第一行"}
 你 › /tool workspace.v1 write  {"path":"notes/a.txt","content":"\n第二行","append":true}
 你 › /tool workspace.v1 read   {"path":"notes/a.txt"}
+你 › /tool workspace.v1 read   {"path":"notes/a.txt","encoding":"gb18030"}   # 中文遗留编码（GBK/GB2312 同）
 你 › /tool workspace.v1 mkdir  {"path":"src/utils"}
 你 › /tool workspace.v1 copy   {"from":"notes/a.txt","to":"notes/b.txt"}
 你 › /tool workspace.v1 move   {"from":"notes/b.txt","to":"src/b.txt"}
@@ -1708,9 +1722,14 @@ Python / TypeScript 插件走语言适配器路线（规范 2.7）：适配器�
 - `core.log` 同时作为事件广播，日志插件可订阅接管
 - 新增能力方法 `core.fs.delete` / `core.fs.move` / `core.fs.mkdir` 与权限 `filesystem:delete`
 - `core.fs.read` / `core.fs.write` / `core.net.request` 各新增可选参数 `encoding`
-  （`"base64"` 时二进制安全：读图片、写图片、下载图片都靠它），返回体相应多一个 `encoding` 字段
+  （`"base64"` 时二进制安全：读图片、写图片、下载图片都靠它），返回体相应多一个 `encoding` 字段；
+  `core.fs.read` 的 `encoding` 另接受 `"gb18030"`（兼容 `"gbk"` / `"gb2312"` / `"cp936"`），
+  用于读 Excel 导出的 CSV、国产软件日志等中文遗留编码文件，返回体多一个 `decodedFrom` 字段标明来源
 - 新增能力方法 `core.shell.open` 与权限 `shell:open` —— 只用系统默认程序打开一个已存在的文件，
   命令与参数由核心写死，插件只能给路径（比 `process:spawn` 窄得多）
+- 新增能力方法 `core.shell.pickfolder` 与权限 `shell:pickfolder` —— 弹系统自带的文件夹选择对话框，
+  返回 `{path, cancelled}`；不执行插件指定的任何命令，比 `process:spawn` 窄得多（仅 Windows，
+  其他平台返回不支持）。工作区插件用它挑目录
 - 派生插件 `com.official.imagegen`（`imagegen.v1`）与 llm 的识图配置项
   `visionProvider` / `visionBaseUrl` / `visionApiKey` / `visionModel`
 - 消息格式新增可选字段 `parts`（多模态：文本 + 图片），`agent.v1` / `llm.v1` / `session.v1` /
@@ -1875,6 +1894,7 @@ SDK 与插件都不属于核心，不计入上面的约束：
 - [x] **启停往返**：禁用 → 重启后该插件不再加载 → 启用 → 重启后恢复加载
 - [x] **运行中插件的启停被推迟**：目录被占用改不动名时记为 pending，启动时执行，不产生半改状态
 - [x] **工作区文件操作**：指定文件夹后创建 / 写入 / 追加 / 读取 / 复制 / 移动 / 删除 / 建目录 / 列目录 / 目录树全部可用
+- [x] **中文路径与中文文本**：系统选目录的结果经 UTF-8 base64 交回来（PowerShell 写管道用的是系统代码页，中文机器上是 GBK），`E:\万物皆插件` 这类路径不再变形；读 GB18030 写的 `.txt`（Excel 导的 CSV 也是）能转成 UTF-8 正常显示，截断也不再切出半个汉字
 - [x] **全盘可访问**：相对路径落工作目录，绝对路径（含他盘）直通；核心运行时目录本身与其一级子目录仍不可删，工作目录自身不可删
 - [x] **「工作区」页由插件自带**：workspace 插件提供 `ui.page.workspace.v1` 并自己渲染这一页；单测覆盖"每行恰好等于给定宽度""点目录进入""回车设为工作区""点击定位光标""状态变了必须喊一声"
 - [x] **「角色」页搬进了 roleplay 插件**：界面那边删掉 `tabRole`、三个角色类型、一屏渲染函数与 20 多个后端方法；插件侧单测覆盖"每行不超过给定宽度""点列表换人""打字进当前字段""Ctrl+Enter 保存""没动过的记忆不提交""删除要两次""预览显示真正会发出去的那段""焦点跑出可视区时自己滚过去""模型 remember 之后页面跟着刷新"

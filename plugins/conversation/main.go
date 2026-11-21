@@ -75,7 +75,8 @@ func (c *Conversation) Activate(ctx *plugin.Context) error {
 		"description": "链式对话：消息树、版本翻页、多会话管理",
 		"methods": []string{
 			"list", "newSession", "deleteSession", "switch", "history",
-			"send", "edit", "regenerate", "switchVersion", "share", "export", "info",
+			"send", "edit", "regenerate", "switchVersion", "deleteMessage",
+			"share", "export", "info",
 		},
 	}); err != nil {
 		return err
@@ -122,6 +123,8 @@ func (c *Conversation) Handle(service, method string, args json.RawMessage) (any
 		return c.regenerate(args)
 	case "switchVersion":
 		return c.switchVersion(args)
+	case "deleteMessage":
+		return c.deleteMessage(args)
 	case "share":
 		return c.share(args)
 	case "export":
@@ -555,6 +558,27 @@ func (c *Conversation) switchVersion(args json.RawMessage) (any, error) {
 	}
 	return c.apply(in.SessionID, func(s *Session) error {
 		return s.SwitchVersion(in.NodeID, in.Delta)
+	})
+}
+
+// deleteMessage 删除一条消息及其下游回复（整棵子树）。
+//
+// 与 edit 的「旧版本原地保留」不同，这是用户主动删除，节点真正从树里消失。
+func (c *Conversation) deleteMessage(args json.RawMessage) (any, error) {
+	var in struct {
+		SessionID string `json:"sessionId,omitempty"`
+		NodeID    string `json:"nodeId"`
+	}
+	if err := json.Unmarshal(args, &in); err != nil {
+		return nil, plugin.Errorf(plugin.CodeInvalidParams, "参数非法: %v", err)
+	}
+	return c.apply(in.SessionID, func(s *Session) error {
+		removed, err := s.DeleteNode(in.NodeID)
+		if err != nil {
+			return err
+		}
+		c.ctx.Log("info", "消息已删除", map[string]any{"session": s.ID, "node": in.NodeID, "removed": removed})
+		return nil
 	})
 }
 

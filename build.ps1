@@ -67,11 +67,9 @@ Build-GoPlugin "builder" | Out-Null
 # Usage monitor: DeepSeek balance + token/cache-hit overlay (reads llm.usage events).
 Build-GoPlugin "usage-monitor" | Out-Null
 
-# Default UI: the clickable workbench.
-# minimal-ui also provides ui.v1; installing both would make them fight over the
-# terminal (whoever registers first wins), so only workbench goes into plugins/.
-# minimal-ui is kept as the fallback UI packaged under builtin/ instead.
-Build-GoPlugin "workbench" | Out-Null
+# Default UI: the native Gio desktop GUI. It replaces the old terminal UI
+# (aurora) and the browser UI (webui); neither is shipped in runtime/plugins.
+Build-GoPlugin "gui" | Out-Null
 
 # ---------------------------------------------------------------------------
 # 内置官方 UI 包：产物只落在 runtime/builtin/
@@ -118,7 +116,10 @@ $appName = (Get-Content -Raw -Encoding UTF8 (Join-Path $root "launcher\name.txt"
 $exePath = Join-Path $root ($appName + $bin)
 
 go run ./tools/icon2ico -in (Join-Path $root "launcher\assets\appicon.png") -out $ico
-go build -trimpath -o $exePath ./launcher
+# -H=windowsgui: no console window on double-click. The launcher only starts the
+# core and shows message boxes; it never needs stdin/stdout itself. The core is
+# spawned with CREATE_NO_WINDOW (or CREATE_NEW_CONSOLE for the first-run TUI menu).
+go build -trimpath -ldflags "-H=windowsgui" -o $exePath ./launcher
 
 try {
   # Launcher first: it is never running while you build, so the entry point

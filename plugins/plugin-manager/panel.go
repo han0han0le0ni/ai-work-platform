@@ -308,13 +308,14 @@ func (p *pmPanel) render(m *Manager, req plugin.PanelRequest) plugin.PanelRender
 	if n := len(p.items) - listRows; n > 0 {
 		listFrom = plugin.Window(p.sel, 0, listRows, len(p.items))
 	}
+
+	if wide {
+		return p.renderWide(b, entries, listW, detailW, listFrom, scroll, maxScroll, top, ch, w)
+	}
+
 	for i := 0; i < ch; i++ {
 		y := top + i
-		if wide {
-			p.drawListRow(b, y, listW, listFrom, i)
-			b.At(y).Text(plugin.SBorder, "│")
-			b.At(y).Text("", " ")
-		} else if i < detailTop {
+		if i < detailTop {
 			p.drawListRow(b, y, w, listFrom, i)
 		}
 		if i >= detailTop {
@@ -325,6 +326,56 @@ func (p *pmPanel) render(m *Manager, req plugin.PanelRequest) plugin.PanelRender
 	}
 
 	res := b.Render(scroll, maxScroll, pmHint(w))
+	res.WantKeys = true
+	return res
+}
+
+// renderWide 在宽屏（两栏并排）时渲染：列表在左、详情在右。
+//
+// 两栏各自在独立的 Block 里画（坐标都从第 0 列起），再拼成一行：
+// 列表行 + 分隔线 + 详情行。详情的热区 x 要整体加上列表宽 + 2 的偏移 ——
+// 这是「禁用按钮点不到」的根子：detailLines 里的按钮按「从第 0 列开始」
+// 登记绝对坐标，若直接顺序追加到同一行，文本画对了、热区却还落在列表那一列。
+func (p *pmPanel) renderWide(b *plugin.Block, entries []pmEntry, listW, detailW, listFrom, scroll, maxScroll, top, ch, w int) plugin.PanelRender {
+	lb := plugin.NewBlock(listW, ch)
+	rb := plugin.NewBlock(detailW, ch)
+	for i := 0; i < ch; i++ {
+		p.drawListRow(lb, i, listW, listFrom, i)
+		if idx := scroll + i; idx < len(entries) {
+			entries[idx].draw(rb, i)
+		}
+	}
+
+	ll := lb.Lines()
+	rl := rb.Lines()
+	sep := plugin.Style(plugin.SBorder).S("│") + " "
+
+	// 头部（前 top 行）已经在 b 里画好，直接取出来用。
+	head := b.Lines()
+	lines := make([]string, 0, top+ch)
+	lines = append(lines, head[:top]...)
+	for i := 0; i < ch; i++ {
+		lines = append(lines, ll[i]+sep+rl[i])
+	}
+
+	hits := append([]plugin.Hit{}, b.Hits()...)
+	for _, h := range lb.Hits() {
+		h.Y += top
+		hits = append(hits, h)
+	}
+	for _, h := range rb.Hits() {
+		h.Y += top
+		h.X += listW + 2
+		hits = append(hits, h)
+	}
+
+	res := plugin.PanelRender{
+		Lines:     lines,
+		Hits:      hits,
+		Scroll:    scroll,
+		MaxScroll: maxScroll,
+		Note:      pmHint(w),
+	}
 	res.WantKeys = true
 	return res
 }
@@ -656,22 +707,28 @@ func (p *pmPanel) action(m *Manager, req plugin.PanelRequest) string {
 		p.setFocus(p.ringList(i))
 		return p.say(m, "已选中 "+firstNonEmpty(p.items[i].info.ID, p.items[i].info.Dir), true)
 
-	case "toggle":
-		p.setFocus(p.ringToggle())
-		return p.toggle(m)
-
-	case "del":
-		p.setFocus(p.ringDel())
-		return p.remove(m)
-
-	case "delcancel":
-		p.confirmDel = false
-		return p.say(m, "已取消删除", true)
-
-	case "reload":
-		p.setFocus(p.ringButton(0))
-		p.load(m)
-		return p.say(m, fmt.Sprintf("已重新扫描：%d 个插件", len(p.items)), true)
+	case "btn":
+		// 详情区与顶栏的按钮，热区 Action 统一是 "btn"，真正的动作在 Arg 里。
+		//
+		// 这里曾只按 req.Action 匹配 toggle/del/reload，而按钮登记的热区
+		// Action 却是 "btn"，于是鼠标点按钮永远落不进任何分支、点了没反应；
+		// 键盘（enterRing）直接调 toggle/remove，反而正常 —— 这也是"鼠标点不动、
+		// 键盘能触发"的根子。
+		switch req.Arg {
+		case "toggle":
+			p.setFocus(p.ringToggle())
+			return p.toggle(m)
+		case "del":
+			p.setFocus(p.ringDel())
+			return p.remove(m)
+		case "delcancel":
+			p.confirmDel = false
+			return p.say(m, "已取消删除", true)
+		case "reload":
+			p.setFocus(p.ringButton(0))
+			p.load(m)
+			return p.say(m, fmt.Sprintf("已重新扫描：%d 个插件", len(p.items)), true)
+		}
 	}
 	return ""
 }

@@ -276,50 +276,34 @@ func (p *llmPanel) render(l *LLM, req plugin.PanelRequest) plugin.PanelRender {
 	left := p.leftColumn(l, leftW)
 	right := p.rightColumn(l, rightW)
 
-	// 两栏并成一栏时中间加一条分隔线：不隔开，「API Key」小节看起来像是
-	// 上面「自定义本地服务」的一部分，而它们其实是两回事（连哪儿 / 凭什么连）。
+	// 行数 = 两栏里较长的那一个。焦点环里的控件对应到行号（滚动用）。
+	// wide 两栏并排时 left[i] 与 right[i] 都在第 i 行；单栏时右栏叠在
+	// 左栏 + 分隔线之后。
 	var doc []llmEntry
-	var rowOfIndex func([]llmEntry, int)
+	rows := 0
 	if wide {
-		n := maxInt(len(left), len(right))
-		doc = make([]llmEntry, 0, n)
-		for i := 0; i < n; i++ {
-			var le, re *llmEntry
+		rows = maxInt(len(left), len(right))
+		for i := 0; i < rows; i++ {
 			if i < len(left) {
-				le = &left[i]
+				for _, c := range left[i].ctls {
+					p.rowOf[c] = i
+				}
 			}
 			if i < len(right) {
-				re = &right[i]
-			}
-			li, ri := le, re
-			doc = append(doc, llmEntry{draw: func(b *plugin.Block, y int) {
-				if li != nil {
-					li.draw(b, y)
-				}
-				b.At(y).Text(plugin.SBorder, "│")
-				b.At(y).Text("", " ")
-				if ri != nil {
-					ri.draw(b, y)
-				}
-			}})
-		}
-		rowOfIndex = func(list []llmEntry, at int) {
-			if at >= 0 && at < len(list) {
-				for _, c := range list[at].ctls {
-					p.rowOf[c] = at
+				for _, c := range right[i].ctls {
+					p.rowOf[c] = i
 				}
 			}
-		}
-		for i := range doc {
-			rowOfIndex(left, i)
-			rowOfIndex(right, i)
 		}
 	} else {
+		// 单栏时中间加一条分隔线：不隔开，「API Key」小节看起来像是
+		// 上面「自定义本地服务」的一部分，而它们其实是两回事（连哪儿 / 凭什么连）。
 		doc = append(doc, left...)
 		doc = append(doc, llmEntry{draw: func(b *plugin.Block, y int) {
 			b.At(y).Text(plugin.SBorder, strings.Repeat("─", maxInt(1, w)))
 		}})
 		doc = append(doc, right...)
+		rows = len(doc)
 		for i, e := range doc {
 			for _, c := range e.ctls {
 				p.rowOf[c] = i
@@ -327,7 +311,7 @@ func (p *llmPanel) render(l *LLM, req plugin.PanelRequest) plugin.PanelRender {
 		}
 	}
 
-	maxScroll := maxInt(0, len(doc)-ch)
+	maxScroll := maxInt(0, rows-ch)
 	scroll := clampInt(req.Scroll, 0, maxScroll)
 	// 焦点必须看得见：只有这一页自己知道环上第 n 个控件画在第几行
 	if row, ok := p.rowOf[p.focus]; ok {
@@ -338,6 +322,11 @@ func (p *llmPanel) render(l *LLM, req plugin.PanelRequest) plugin.PanelRender {
 		}
 		scroll = clampInt(scroll, 0, maxScroll)
 	}
+
+	if wide {
+		return p.renderWide(left, right, leftW, rightW, b, scroll, maxScroll, top, ch)
+	}
+
 	for i := 0; i < ch; i++ {
 		if idx := scroll + i; idx < len(doc) {
 			doc[idx].draw(b, top+i)
@@ -347,6 +336,61 @@ func (p *llmPanel) render(l *LLM, req plugin.PanelRequest) plugin.PanelRender {
 	res := b.Render(scroll, maxScroll, llmHint(p.mode))
 	res.WantKeys = true
 	res.WantCopy = true // 有密钥 / 地址 / 模型输入框：Ctrl+C 交给这一页复制
+	return res
+}
+
+// renderWide 在宽屏（两栏并排）时渲染。
+//
+// 两栏各自在独立的 Block 里画（坐标都从第 0 列起），再拼成一行：
+// 左栏行 + 分隔线 + 右栏行。右栏的热区 x 要整体加上左栏宽 + 2 的偏移 ——
+// 这是「按钮点不灵」的根子：entryBuilder 里的按钮 / chip / 输入框都按
+// 「从第 0 列开始」登记绝对坐标，若直接顺序追加到同一行，文本画对了、
+// 热区却还落在左栏那一列，点上自然没反应。
+func (p *llmPanel) renderWide(left, right []llmEntry, leftW, rightW int, b *plugin.Block, scroll, maxScroll, top, ch int) plugin.PanelRender {
+	lb := plugin.NewBlock(leftW, ch)
+	rb := plugin.NewBlock(rightW, ch)
+	for i := 0; i < ch; i++ {
+		idx := scroll + i
+		if idx < len(left) {
+			left[idx].draw(lb, i)
+		}
+		if idx < len(right) {
+			right[idx].draw(rb, i)
+		}
+	}
+
+	ll := lb.Lines()
+	rl := rb.Lines()
+	sep := plugin.Style(plugin.SBorder).S("│") + " "
+
+	// 头部（前 top 行）已经在 b 里画好，直接取出来用。
+	head := b.Lines()
+	lines := make([]string, 0, top+ch)
+	lines = append(lines, head[:top]...)
+	for i := 0; i < ch; i++ {
+		lines = append(lines, ll[i]+sep+rl[i])
+	}
+
+	hits := append([]plugin.Hit{}, b.Hits()...)
+	for _, h := range lb.Hits() {
+		h.Y += top
+		hits = append(hits, h)
+	}
+	for _, h := range rb.Hits() {
+		h.Y += top
+		h.X += leftW + 2
+		hits = append(hits, h)
+	}
+
+	res := plugin.PanelRender{
+		Lines:     lines,
+		Hits:      hits,
+		Scroll:    scroll,
+		MaxScroll: maxScroll,
+		Note:      llmHint(p.mode),
+	}
+	res.WantKeys = true
+	res.WantCopy = true
 	return res
 }
 

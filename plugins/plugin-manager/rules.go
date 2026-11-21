@@ -56,10 +56,25 @@ var rulesSections = []rulesSection{
 		"shell:open",
 		"sandbox:use",
 	}},
-	{head: "自带界面（ui.page.*）", body: []string{
+	{head: "界面贡献（ui.contrib.v1）", body: []string{
+		"provides 声明 ui.contrib.v1，实现 list",
+		"插槽：sidebar.nav / header.action",
+		"      sidebar.footer.action / settings.section",
+		"条目字段：slot id label icon order",
+		"page.native 指向内置页，或 service+panel",
+		"壳子决定几何与样式，插件不画尺寸颜色",
+	}},
+	{head: "自带面板（ui.page.*）", body: []string{
 		"在 provides 里声明 ui.page.<名字>.v1",
 		"实现 list / render / action / key 四个方法",
-		"界面自动把它合成到标签栏，不用改界面",
+		"没被 sidebar.nav 认领的面板折成侧栏一行",
+		"render 返回文本网格，滚轮翻页由壳子负责",
+	}},
+	{head: "原生页与服务", body: []string{
+		"提供 roleplay.v1 / imagegen.v1 / agent.v1",
+		"  pluginManager.v1 / workspace.v1 / usage.v1",
+		"壳子给出配套原生页；插件停用则入口消失",
+		"提供 ui.v1 的插件不能热卸载，删除须重启",
 	}},
 }
 
@@ -111,6 +126,6 @@ func renderRules(req plugin.PanelRequest) plugin.PanelRender {
 		}
 	}
 	// 这一页没有按钮、没有可编辑字段，键盘交给宿主的滚轮翻页即可。
-	res := b.Render(scroll, maxScroll, "滚轮翻阅 · 这些规则由核心在注册与加载时强制执行")
+	res := b.Render(scroll, maxScroll, "滚轮翻阅 · 命名与 manifest 由核心强制，界面插槽由壳子执行")
 	return res
 }

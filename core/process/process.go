@@ -400,9 +400,22 @@ func (p *Plugin) Stop(grace time.Duration) {
 	}
 }
 
+// truncate 把文本截到 n 字节以内再补一个省略标记。
+//
+// 上限按字节算，而一个汉字占 3 个字节：直接 s[:n] 会把某个字劈成两半，
+// 截断处留下半个 UTF-8 序列，往后传一路都带着一个 U+FFFD —— 插件的报错
+// 与日志多半是中文的，坏在这一刀上正好是用户最需要读的那几句。
+// UTF-8 的后续字节一律形如 10xxxxxx，往回退到不是它的那一个即可。
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "...(截断)"
+	if n <= 0 {
+		return "...(截断)"
+	}
+	end := n
+	for end > 0 && s[end]&0xc0 == 0x80 {
+		end--
+	}
+	return s[:end] + "...(截断)"
 }

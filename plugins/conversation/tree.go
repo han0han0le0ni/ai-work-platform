@@ -254,3 +254,60 @@ func (s *Session) VersionOf(id string) (version, total int) {
 	}
 	return indexOf(*g, id) + 1, len(*g)
 }
+
+// DeleteNode 删除一条消息**及其整棵下游子树**，并把它从兄弟组里摘除。
+//
+// 这是用户显式的删除，和「改消息只增不删」的版本哲学不同：节点连同从它
+// 长出来的所有版本与回复一起消失。删掉的若正是父节点当前选中的版本，
+// 选中位回退到前一个兄弟；整组删空时父节点自然变成叶子，根组删空即空会话。
+// 返回实际删除的节点数。
+func (s *Session) DeleteNode(id string) (int, error) {
+	n, ok := s.Nodes[id]
+	if !ok {
+		return 0, plugin.Errorf(plugin.CodeInvalidParams, "找不到消息 %s", id)
+	}
+
+	removed := 0
+	var walk func(string)
+	walk = func(x string) {
+		xn, ok := s.Nodes[x]
+		if !ok {
+			return
+		}
+		for _, ch := range xn.Children {
+			walk(ch)
+		}
+		delete(s.Nodes, x)
+		removed++
+	}
+	walk(id)
+
+	parent := n.Parent
+	g := s.group(parent)
+	idx := -1
+	if g != nil {
+		idx = indexOf(*g, id)
+		if idx >= 0 {
+			*g = append((*g)[:idx], (*g)[idx+1:]...)
+		}
+	}
+
+	// 修正父节点的选中位：删的在选中位之前（或就是选中位），选中位前移一格。
+	if parent == "" {
+		switch {
+		case len(s.Roots) == 0:
+			s.RootActive = 0
+		case idx >= 0 && idx <= s.RootActive:
+			s.RootActive = clampInt(s.RootActive-1, 0, len(s.Roots)-1)
+		}
+	} else if p, ok := s.Nodes[parent]; ok {
+		switch {
+		case len(p.Children) == 0:
+			p.Active = 0
+		case idx >= 0 && idx <= p.Active:
+			p.Active = clampInt(p.Active-1, 0, len(p.Children)-1)
+		}
+	}
+	s.Updated = nowISO()
+	return removed, nil
+}

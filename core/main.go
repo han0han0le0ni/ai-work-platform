@@ -75,6 +75,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "核心运行失败:", err)
 		os.Exit(1)
 	}
+	// 显式退出：Host.Shutdown 已停掉全部插件、关完日志并关闭 stopped，
+	// 这里直接终结进程，避免个别后台 goroutine / 子进程句柄把退出挂住。
+	os.Exit(0)
 }
 
 func usage() {

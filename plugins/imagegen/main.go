@@ -19,7 +19,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -106,10 +105,10 @@ func (p *Provider) Handle(service, method string, args json.RawMessage) (any, er
 
 func (p *Provider) settings() settings {
 	s := settings{
-		Provider: strings.ToLower(strings.TrimSpace(p.pick("provider", "AIWORK_IMAGE_PROVIDER"))),
-		BaseURL:  strings.TrimSpace(p.pick("baseUrl", "AIWORK_IMAGE_BASE_URL")),
-		Model:    strings.TrimSpace(p.pick("model", "AIWORK_IMAGE_MODEL")),
-		APIKey:   strings.TrimSpace(p.pick("apiKey", "AIWORK_IMAGE_API_KEY")),
+		Provider: strings.ToLower(strings.TrimSpace(p.ctx.Pick("provider", "AIWORK_IMAGE_PROVIDER"))),
+		BaseURL:  strings.TrimSpace(p.ctx.Pick("baseUrl", "AIWORK_IMAGE_BASE_URL")),
+		Model:    strings.TrimSpace(p.ctx.Pick("model", "AIWORK_IMAGE_MODEL")),
+		APIKey:   strings.TrimSpace(p.ctx.Pick("apiKey", "AIWORK_IMAGE_API_KEY")),
 		Dir:      strings.TrimSpace(p.ctx.GetConfigString("dir", "")),
 		Size:     strings.TrimSpace(p.ctx.GetConfigString("size", "")),
 	}
@@ -126,22 +125,6 @@ func (p *Provider) settings() settings {
 		s.Size = "1024x1024"
 	}
 	return s
-}
-
-// pick 按顺序找第一个非空来源：插件配置 -> 环境变量。
-func (p *Provider) pick(key string, envs ...string) string {
-	if v, err := p.ctx.GetConfig(key); err == nil && len(v) > 0 {
-		var s string
-		if json.Unmarshal(v, &s) == nil && strings.TrimSpace(s) != "" {
-			return s
-		}
-	}
-	for _, e := range envs {
-		if v := os.Getenv(e); v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 func defaultBaseURL(provider string) string {

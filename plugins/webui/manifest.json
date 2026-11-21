@@ -1,0 +1,15 @@
+{
+  "id": "com.official.webui",
+  "name": "Web UI",
+  "description": "浏览器图形界面：起本地 HTTP 服务（SSE 推送），用浏览器聊天。与终端界面（aurora/workbench）共存，互不影响",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["webui.v1"],
+  "consumes": ["conversation.v1", "session.v1", "agent.v1", "llm.v1", "toolExecutor.v1"],
+  "permissions": ["shell:pickfolder"],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

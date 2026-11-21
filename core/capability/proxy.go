@@ -43,6 +43,10 @@ const (
 	// 它刻意比 process:spawn 窄得多：命令与参数都由核心写死，插件只能给路径，
 	// 所以 UI 这类插件可以拿它开图片，而不必拿到"能执行任意命令"的生杀大权。
 	PermShellOpen = "shell:open"
+	// PermShellPickFolder 只允许"弹系统文件夹选择对话框，拿回用户选的目录"。
+	// 它同样比 process:spawn 窄：不执行任何插件指定的命令，只调系统自带的
+	// 选目录对话框，结果是一个路径字符串。
+	PermShellPickFolder = "shell:pickfolder"
 )
 
 // 能力方法与所需权限。这是核心暴露给插件的**能力面**，属于公开契约，只增不减。
@@ -53,9 +57,10 @@ var requirements = map[string]string{
 	"core.fs.delete":     PermFSDelete,
 	"core.fs.move":       PermFSWrite,
 	"core.fs.mkdir":      PermFSWrite,
-	"core.net.request":   PermNetwork,
-	"core.process.spawn": PermProcessSpawn,
-	"core.shell.open":    PermShellOpen,
+	"core.net.request":     PermNetwork,
+	"core.process.spawn":   PermProcessSpawn,
+	"core.shell.open":      PermShellOpen,
+	"core.shell.pickfolder": PermShellPickFolder,
 }
 
 const (
@@ -186,6 +191,8 @@ func (p *Proxy) Dispatch(pluginID, method string, params json.RawMessage) (any, 
 		return p.spawn(pluginID, params)
 	case "core.shell.open":
 		return p.shellOpen(pluginID, params)
+	case "core.shell.pickfolder":
+		return p.pickFolder(pluginID, params)
 	}
 	return nil, jsonrpc.NewError(jsonrpc.CodeMethodNotFound, "核心不支持方法 %s", method)
 }
@@ -198,7 +205,7 @@ func (p *Proxy) fsRead(pluginID string, params json.RawMessage) (any, *jsonrpc.E
 	var in struct {
 		Path     string `json:"path"`
 		Limit    int64  `json:"limit,omitempty"`
-		Encoding string `json:"encoding,omitempty"` // "base64"：二进制安全，读图片/音视频用
+		Encoding string `json:"encoding,omitempty"` // "base64"：二进制安全；"gb18030"：中文遗留编码
 	}
 	if err := unmarshal(params, &in); err != nil {
 		return nil, badParams(err)
@@ -207,6 +214,7 @@ func (p *Proxy) fsRead(pluginID string, params json.RawMessage) (any, *jsonrpc.E
 		return nil, badParams(errors.New("缺少 path"))
 	}
 	asBase64 := strings.EqualFold(strings.TrimSpace(in.Encoding), "base64")
+	asGB18030 := isGB18030(in.Encoding)
 	abs, rpcErr := p.resolve(in.Path)
 	if rpcErr != nil {
 		return nil, rpcErr
@@ -233,7 +241,7 @@ func (p *Proxy) fsRead(pluginID string, params json.RawMessage) (any, *jsonrpc.E
 	}
 	truncated := false
 	if int64(len(data)) > limit {
-		data = data[:limit]
+		data = cutUTF8(data, limit)
 		truncated = true
 	}
 	p.audit(pluginID, "core.fs.read", abs)
@@ -250,12 +258,71 @@ func (p *Proxy) fsRead(pluginID string, params json.RawMessage) (any, *jsonrpc.E
 		}, nil
 	}
 
+	// 中文遗留编码：扩展名看着是 .txt，字节却是 GB18030 写的（Excel 导出的 CSV、
+	// 老编辑器存的文本、多数国产软件写的日志都是这一族 —— 也就是绝大多数中文文本
+	// 文件的实际样子）。按 UTF-8 去读它们，每个字都会在 JSON 那一趟变成 U+FFFD，
+	// 读到的人看到的就是"一个字都不认识"。注明来源后才换行，认得出也说得清出处。
+	if asGB18030 {
+		text, err := decodeGB18030(data)
+		if err != nil {
+			return nil, badParams(fmt.Errorf("按 GB18030 解码 %s 失败: %v", abs, err))
+		}
+		return map[string]any{
+			"path":      abs,
+			"size":      info.Size(),
+			"encoding":  "gb18030",
+			"content":   trimUTF8BOM(text),
+			"truncated": truncated,
+		}, nil
+	}
+
 	return map[string]any{
 		"path":      abs,
 		"size":      info.Size(),
-		"content":   string(data),
+		"content":   trimUTF8BOM(string(data)),
 		"truncated": truncated,
 	}, nil
+}
+
+// isGB18030 判断 encoding 是否指定了一种中文遗留编码。
+//
+// GB18030 向下包含 GBK 与 GB2312，所以这几个名字在核心这里是同一套解码 ——
+// 用户不会知道手上那份文件到底是 GBK 还是 GB2312，他能说出口的其实只有
+// "这是中文的"这一件事。
+func isGB18030(enc string) bool {
+	switch strings.ToLower(strings.TrimSpace(enc)) {
+	case "gb18030", "gbk", "gb2312", "cp936":
+		return true
+	}
+	return false
+}
+
+// trimUTF8BOM 去掉 UTF-8 文件开头的字节序标记。
+//
+// 那是 Windows 那边留下来的老习惯，不属于文件内容本身：留着的话读到的文本开头
+// 会多一个看不见的字符，比对和拼接都会莫名对不上。
+func trimUTF8BOM(s string) string {
+	return strings.TrimPrefix(s, "\ufeff")
+}
+
+// cutUTF8 把文本截到 n 字节以内，且不把多字节字符劈成两半。
+//
+// limit 是按字节算的上限，而一个汉字是 3 个字节：直接 data[:n] 的话，切点极易
+// 落在某个字的第二个字节上，末尾留下半个 UTF-8 序列，再经 JSON 一趟就变成一个
+// U+FFFD —— 截断本身看得出来（truncated 已经为 true），但那个多余的问号让人以为
+// 文件坏了。UTF-8 的后续字节一律形如 10xxxxxx，往回退到不是它的那一个即可。
+func cutUTF8(data []byte, n int64) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if int64(len(data)) <= n {
+		return data
+	}
+	end := int(n)
+	for end > 0 && data[end]&0xc0 == 0x80 {
+		end--
+	}
+	return data[:end]
 }
 
 func (p *Proxy) fsWrite(pluginID string, params json.RawMessage) (any, *jsonrpc.Error) {
@@ -815,6 +882,39 @@ func (p *Proxy) shellOpen(pluginID string, params json.RawMessage) (any, *jsonrp
 
 	p.audit(pluginID, "core.shell.open", abs)
 	return map[string]any{"path": abs, "opened": true}, nil
+}
+
+// pickFolder 弹系统文件夹选择对话框，拿回用户选的目录（需 shell:pickfolder）。
+//
+// 它刻意比 process.spawn 窄：不执行任何插件指定的命令，只调系统自带的选择器。
+// 这是**阻塞**调用 —— 对话框开着时核心就在等用户选完，调用方（通常是界面）应
+// 把它当成一次"等用户回答"的操作，而不是后台任务。
+func (p *Proxy) pickFolder(pluginID string, params json.RawMessage) (any, *jsonrpc.Error) {
+	var in struct {
+		Initial string `json:"initial,omitempty"`
+		Title   string `json:"title,omitempty"`
+	}
+	if err := unmarshal(params, &in); err != nil {
+		return nil, badParams(err)
+	}
+	// 初始目录如果给了，就按 fsRoot 的围栏规则解析一次（配了 fsRoot 时仍受约束）
+	if strings.TrimSpace(in.Initial) != "" {
+		abs, rpcErr := p.resolve(in.Initial)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		in.Initial = abs
+	}
+	path, cancelled, err := pickFolder(in.Title, in.Initial)
+	if err != nil {
+		return nil, failed("弹系统文件夹选择框失败: %v", err)
+	}
+	target := path
+	if cancelled {
+		target = "（用户取消）"
+	}
+	p.audit(pluginID, "core.shell.pickfolder", target)
+	return map[string]any{"path": path, "cancelled": cancelled}, nil
 }
 
 // openCommand 给出"用默认程序打开这个文件"的命令。

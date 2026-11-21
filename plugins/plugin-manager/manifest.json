@@ -6,7 +6,7 @@
   "apiVersion": "1",
   "entry": "main",
   "runtime": "binary",
-  "provides": ["pluginManager.v1", "ui.page.pluginmanager.v1"],
+  "provides": ["pluginManager.v1", "ui.page.pluginmanager.v1", "ui.contrib.v1"],
   "consumes": [],
   "permissions": ["filesystem:read", "filesystem:write", "filesystem:delete"],
   "compat": {

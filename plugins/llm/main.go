@@ -92,7 +92,7 @@ func (l *LLM) Activate(ctx *plugin.Context) error {
 	l.panel = newLLMPanel()
 	if err := ctx.Provide(serviceName, map[string]any{
 		"description": "把消息与工具定义翻译成模型调用，返回文本与工具调用",
-		"methods":     []string{"chat", "models", "providers", "configure", "ping", "discover"},
+		"methods":     []string{"chat", "models", "providers", "presets", "configure", "ping", "discover"},
 		"providers":   []string{"mock", "openai", "ollama"},
 	}); err != nil {
 		return err
@@ -132,6 +132,10 @@ func (l *LLM) Handle(service, method string, args json.RawMessage) (any, error) 
 		return l.models(args)
 	case "providers":
 		return l.providersReport(), nil
+	case "presets":
+		// 服务目录：云端知名 / 自定义冷门 / 本地应用。界面（终端或 Web）据此画预设，
+		// 不再在界面里存第二份 —— 连哪儿、密钥去哪申请、默认端口都是 LLM 领域的知识。
+		return l.presetsReport(), nil
 	case "discover":
 		// 扫描本机常见 AI 端点：界面「本地」那一页靠它回答"这台机器上有没有 AI"。
 		return l.discover(args)
@@ -267,8 +271,27 @@ func (l *LLM) chat(args json.RawMessage) (any, error) {
 
 func (l *LLM) providersReport() map[string]any {
 	cfg := l.settings()
+	list, activeID := l.allProviders(cfg)
+	providersOut := make([]map[string]any, 0, len(list))
+	for _, e := range list {
+		providersOut = append(providersOut, map[string]any{
+			"id":           e.ID,
+			"preset":       e.Preset,
+			"label":        e.displayLabel(),
+			"provider":     e.Provider,
+			"baseUrl":      e.BaseURL,
+			"apiKey":       maskKey(e.APIKey),
+			"hasKey":       e.APIKey != "",
+			"model":        e.Model,
+			"visionModel":  e.VisionModel,
+			"systemPrompt": e.SystemPrompt,
+			"active":       e.ID == activeID,
+		})
+	}
 	return map[string]any{
-		"current": cfg.Provider,
+		"current":   cfg.Provider,
+		"active":    activeID,
+		"providers": providersOut,
 		"available": []map[string]any{
 			{
 				"name": "mock", "model": "mock-1",
@@ -308,6 +331,26 @@ func (l *LLM) providersReport() map[string]any {
 	}
 }
 
+// presetsReport 把服务目录摊给界面：谁在哪、用什么协议、密钥去哪申请。
+func (l *LLM) presetsReport() any {
+	out := make([]map[string]any, 0, len(providerPresets))
+	for _, p := range providerPresets {
+		out = append(out, map[string]any{
+			"key":      p.Key,
+			"label":    p.Label,
+			"provider": p.Provider,
+			"baseUrl":  p.BaseURL,
+			"models":   p.Models,
+			"keyUrl":   p.KeyURL,
+			"needKey":  p.NeedKey,
+			"hint":     p.Hint,
+			"note":     p.Note,
+			"group":    p.Group,
+		})
+	}
+	return out
+}
+
 type configureParams struct {
 	Provider     *string  `json:"provider,omitempty"`
 	BaseURL      *string  `json:"baseUrl,omitempty"`
@@ -323,6 +366,13 @@ type configureParams struct {
 	VisionBaseURL  *string `json:"visionBaseUrl,omitempty"`
 	VisionAPIKey   *string `json:"visionApiKey,omitempty"`
 	VisionModel    *string `json:"visionModel,omitempty"`
+
+	// 多服务商：整份列表写回 + 指定当前生效的那条。
+	//
+	// 传了 providers 就按列表模式处理（界面走这条路）；不传则维持老的
+	// 扁平键写法，/tool 与旧界面照旧可用。
+	Providers *[]providerEntry `json:"providers,omitempty"`
+	Active    *string          `json:"active,omitempty"`
 }
 
 // configure 把配置写进本插件的命名空间（plugin-configs/com.official.llm.json）。
@@ -332,6 +382,36 @@ func (l *LLM) configure(args json.RawMessage) (any, error) {
 	var in configureParams
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, plugin.Errorf(plugin.CodeInvalidParams, "参数非法: %v", err)
+	}
+
+	// 列表模式：一次写回全部服务商与当前生效项。
+	if in.Providers != nil {
+		list, err := normalizeProviderEntries(*in.Providers)
+		if err != nil {
+			return nil, err
+		}
+		list = l.mergeProviderKeys(list)
+		active := ""
+		if in.Active != nil {
+			active = strings.TrimSpace(*in.Active)
+		}
+		if err := l.saveProviders(list, active); err != nil {
+			return nil, plugin.Errorf(plugin.CodeInternalError, "写入服务商列表失败: %v", err)
+		}
+		cfg := l.settings()
+		activeID := l.ctx.GetConfigString("activeProvider", "")
+		l.ctx.Log("info", "LLM 服务商列表已更新", map[string]any{
+			"count": len(list), "active": activeID, "provider": cfg.Provider, "model": cfg.Model,
+		})
+		return map[string]any{
+			"ok":      true,
+			"updated": len(list) + 1,
+			"active":  activeID,
+			"current": map[string]any{
+				"provider": cfg.Provider, "baseUrl": cfg.BaseURL,
+				"model": cfg.Model, "apiKey": maskKey(cfg.APIKey),
+			},
+		}, nil
 	}
 
 	type kv struct {
@@ -397,6 +477,40 @@ func (l *LLM) configure(args json.RawMessage) (any, error) {
 	for _, u := range updates {
 		if err := l.ctx.SetConfig(u.key, u.value); err != nil {
 			return nil, plugin.Errorf(plugin.CodeInternalError, "写入配置 %s 失败: %v", u.key, err)
+		}
+	}
+
+	// 只改扁平键时，把改动同步进"当前服务商"那条列表配置，
+	// 否则界面上的卡片会显示旧值，与真正生效的配置对不上。
+	if len(l.storedProviders()) > 0 {
+		fields := map[string]bool{}
+		var patch providerEntry
+		if in.Provider != nil {
+			fields["provider"] = true
+			patch.Provider = strings.ToLower(strings.TrimSpace(*in.Provider))
+		}
+		if in.BaseURL != nil {
+			fields["baseUrl"] = true
+			patch.BaseURL = strings.TrimRight(strings.TrimSpace(*in.BaseURL), "/")
+		}
+		if in.APIKey != nil && !strings.Contains(*in.APIKey, "****") {
+			fields["apiKey"] = true
+			patch.APIKey = strings.TrimSpace(*in.APIKey)
+		}
+		if in.Model != nil {
+			fields["model"] = true
+			patch.Model = strings.TrimSpace(*in.Model)
+		}
+		if in.SystemPrompt != nil {
+			fields["systemPrompt"] = true
+			patch.SystemPrompt = *in.SystemPrompt
+		}
+		if in.VisionModel != nil {
+			fields["visionModel"] = true
+			patch.VisionModel = strings.TrimSpace(*in.VisionModel)
+		}
+		if len(fields) > 0 {
+			l.patchActiveEntry(patch, fields)
 		}
 	}
 
@@ -470,28 +584,21 @@ func (s settings) withVision() settings {
 }
 
 func (l *LLM) settings() settings {
-	s := settings{
-		Provider:  strings.ToLower(strings.TrimSpace(l.pick("provider", "AIWORK_LLM_PROVIDER"))),
-		BaseURL:   strings.TrimSpace(l.pick("baseUrl", "AIWORK_LLM_BASE_URL", "OPENAI_BASE_URL")),
-		APIKey:    strings.TrimSpace(l.pick("apiKey", "AIWORK_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")),
-		Model:     strings.TrimSpace(l.pick("model", "AIWORK_LLM_MODEL")),
-		MaxTokens: l.ctx.GetConfigInt("maxTokens", 0),
-		TimeoutMs: l.ctx.GetConfigInt("timeoutMs", 120000),
-		System:    l.ctx.GetConfigString("systemPrompt", ""),
-
-		VisionProvider: strings.ToLower(strings.TrimSpace(
-			l.pick("visionProvider", "AIWORK_LLM_VISION_PROVIDER"))),
-		VisionBaseURL: strings.TrimSpace(
-			l.pick("visionBaseUrl", "AIWORK_LLM_VISION_BASE_URL")),
-		VisionAPIKey: strings.TrimSpace(
-			l.pick("visionApiKey", "AIWORK_LLM_VISION_API_KEY")),
-		VisionModel: strings.TrimSpace(
-			l.pick("visionModel", "AIWORK_LLM_VISION_MODEL")),
-	}
-	if v, err := l.ctx.GetConfig("temperature"); err == nil && len(v) > 0 {
-		var f float64
-		if json.Unmarshal(v, &f) == nil {
-			s.Temperature = &f
+	s := l.flatSettings()
+	// 有列表配置时，以"当前生效的服务商"为准；扁平键只提供全局参数
+	// （temperature / maxTokens / timeoutMs）和缺省兜底。
+	if list := l.storedProviders(); len(list) > 0 {
+		if e, ok := l.pickActive(list); ok {
+			s.Provider = strings.ToLower(strings.TrimSpace(e.Provider))
+			s.BaseURL = strings.TrimSpace(e.BaseURL)
+			s.APIKey = strings.TrimSpace(e.APIKey)
+			s.Model = strings.TrimSpace(e.Model)
+			if v := strings.TrimSpace(e.VisionModel); v != "" {
+				s.VisionModel = v
+			}
+			if v := strings.TrimSpace(e.SystemPrompt); v != "" {
+				s.System = e.SystemPrompt
+			}
 		}
 	}
 	if s.APIKey == "" {
@@ -517,6 +624,35 @@ func (l *LLM) settings() settings {
 	return s
 }
 
+// flatSettings 只读老的扁平配置，不做任何默认值推断。
+func (l *LLM) flatSettings() settings {
+	s := settings{
+		Provider:  strings.ToLower(strings.TrimSpace(l.ctx.Pick("provider", "AIWORK_LLM_PROVIDER"))),
+		BaseURL:   strings.TrimSpace(l.ctx.Pick("baseUrl", "AIWORK_LLM_BASE_URL", "OPENAI_BASE_URL")),
+		APIKey:    strings.TrimSpace(l.ctx.Pick("apiKey", "AIWORK_LLM_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")),
+		Model:     strings.TrimSpace(l.ctx.Pick("model", "AIWORK_LLM_MODEL")),
+		MaxTokens: l.ctx.GetConfigInt("maxTokens", 0),
+		TimeoutMs: l.ctx.GetConfigInt("timeoutMs", 120000),
+		System:    l.ctx.GetConfigString("systemPrompt", ""),
+
+		VisionProvider: strings.ToLower(strings.TrimSpace(
+			l.ctx.Pick("visionProvider", "AIWORK_LLM_VISION_PROVIDER"))),
+		VisionBaseURL: strings.TrimSpace(
+			l.ctx.Pick("visionBaseUrl", "AIWORK_LLM_VISION_BASE_URL")),
+		VisionAPIKey: strings.TrimSpace(
+			l.ctx.Pick("visionApiKey", "AIWORK_LLM_VISION_API_KEY")),
+		VisionModel: strings.TrimSpace(
+			l.ctx.Pick("visionModel", "AIWORK_LLM_VISION_MODEL")),
+	}
+	if v, err := l.ctx.GetConfig("temperature"); err == nil && len(v) > 0 {
+		var f float64
+		if json.Unmarshal(v, &f) == nil {
+			s.Temperature = &f
+		}
+	}
+	return s
+}
+
 // secretKey 尝试从秘密存储插件取密钥。没装 secrets.v1 时核心返回 -32000，这里静默忽略。
 func (l *LLM) secretKey() string {
 	raw, err := l.ctx.GetSecret("llm.apiKey")
@@ -533,19 +669,6 @@ func (l *LLM) secretKey() string {
 	}
 	if json.Unmarshal(raw, &obj) == nil {
 		return obj.Value
-	}
-	return ""
-}
-
-// pick 先读插件配置，再依次尝试环境变量。
-func (l *LLM) pick(key string, envs ...string) string {
-	if v := l.ctx.GetConfigString(key, ""); v != "" {
-		return v
-	}
-	for _, e := range envs {
-		if v := os.Getenv(e); v != "" {
-			return v
-		}
 	}
 	return ""
 }
