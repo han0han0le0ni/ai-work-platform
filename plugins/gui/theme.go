@@ -30,6 +30,15 @@ var (
 	cPanelAlt  = color.NRGBA{R: 0x2C, G: 0x2C, B: 0x2E, A: 0xFF} // 卡片 / 输入框 layer-2
 	cBorder    = color.NRGBA{R: 0x2E, G: 0x2E, B: 0x30, A: 0xFF} // 0.5px 分隔线（白 12% 叠底）
 	cHover     = color.NRGBA{R: 0x28, G: 0x28, B: 0x2A, A: 0xFF} // 悬浮底（白 8% 叠底）
+	// cHoverLift 是输入卡片等浅一层面板上的悬浮底（白 8% 叠在 #2C2C2E 上），
+	// 对应 DSH --dsw-alias-interactive-bg-hover。
+	cHoverLift = color.NRGBA{R: 0x3A, G: 0x3A, B: 0x3C, A: 0xFF}
+	// cBorderLift 是浅色面板上的描边（白 12% 叠在 #2C2C2E 上），
+	// 对应 DSH --dsw-alias-border-l2，输入卡片用它才看得出卡片边缘。
+	cBorderLift = color.NRGBA{R: 0x45, G: 0x45, B: 0x47, A: 0xFF}
+	// 输入框左侧圆形「+」按钮（DSH --dsw-specific-selector 及其 hover）。
+	cBtnFill  = color.NRGBA{R: 0x35, G: 0x36, B: 0x38, A: 0xFF}
+	cBtnHover = color.NRGBA{R: 0x40, G: 0x41, B: 0x43, A: 0xFF}
 	cNavActive = color.NRGBA{R: 0x43, G: 0x45, B: 0x4A, A: 0xFF} // 侧栏选中项
 	cText      = color.NRGBA{R: 0xF9, G: 0xFA, B: 0xFB, A: 0xFF} // 主文字
 	cTextDim   = color.NRGBA{R: 0xCF, G: 0xD3, B: 0xD6, A: 0xFF} // 次要文字
@@ -62,7 +71,9 @@ const (
 	topBarHeight   = 50  // 10 上 + 30 标题行 + 10 下
 	chatMaxWidth   = 920 // 聊天正文列上限
 	composerMaxW   = chatMaxWidth + 32
-	inputMinHeight = 104 // 输入卡片：8 上内边 + 36 文本 + 12 间距 + 34 工具行 + 余量
+	// 输入卡片（对齐 DSH InputBar）：10 上内边 + 46 文本 + 12 间距 + 34 工具行
+	// + 8 下内边 + 8 卡片底距 = 118。
+	inputMinHeight = 118
 	bubbleGap      = 12  // 消息间距（DSH --dsh-chat-flow-gap）
 	fieldHeight    = 36  // 表单控件高
 	rowGap         = 12

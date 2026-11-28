@@ -215,6 +215,26 @@ type UI struct {
 
 	// 输入焦点请求
 	focusInput bool
+
+	// 输入区选择器：工作模式 / 模型 / 推理程度 / 工作区 / 权限。
+	// 选择只作用于下一次发送，不写进会话，随时可改。
+	workMode     string
+	reasoning    string
+	permission   string
+	composerMenu int
+	menuPills    []widget.Clickable
+	menuRows     []widget.Clickable
+	menuBackdrop widget.Clickable
+	// composerCardX 是输入卡片左边缘的窗口坐标；pillOffset 记录每个选择器
+	// 相对卡片左边缘的 x。下拉菜单据此贴在触发的 chip 上（对齐 DSH popover）。
+	composerCardX int
+	composerBaseX int // 中栏在窗口里的左边缘（输入区面板的原点）
+	pillOffset    [6]int
+
+	// 附件：选完的文件先挂在输入框上方，发送时随消息一起走，不进会话树。
+	atts         []attachFile
+	attachBtn    widget.Clickable
+	attachRemove []widget.Clickable
 }
 
 // 原生页稳定 key。
@@ -245,6 +265,9 @@ func newUI(b *bridge, w *app.Window) *UI {
 		activeKey:  keyChat,
 		pageLoaded: make(map[string]bool),
 		pageScroll: make(map[string]*layout.List),
+		// 默认：工具模式、工作区内修改。推理程度默认跟随模型。
+		workMode:   "tools",
+		permission: "workspace",
 	}
 	u.editor.SingleLine = false
 	u.editor.Submit = true
@@ -336,8 +359,50 @@ func (u *UI) reloadActive() {
 // invalidate 请求 Gio 重绘下一帧。
 func (u *UI) invalidate() { u.window.Invalidate() }
 
+// attachExtraH 是附件 chip 行额外占用的高度（没有附件时为 0）。
+func (u *UI) attachExtraH(gtx layout.Context) int {
+	if len(u.atts) == 0 {
+		return 0
+	}
+	// chip 24 + 上间距 8 + 工具行前间距多留 8，保证正文高度不被挤小。
+	return gtx.Dp(unit.Dp(40))
+}
+
+// pickAttachments 弹系统文件选择框，选中的文件由后台线程读好后送回来。
+func (u *UI) pickAttachments() {
+	root := u.bridge.get().Workspace.Root
+	u.bridge.pickAttachments(root)
+}
+
+// removeAttachment 从输入区移除一个附件。
+func (u *UI) removeAttachment(i int) {
+	if i < 0 || i >= len(u.atts) {
+		return
+	}
+	u.atts = append(u.atts[:i], u.atts[i+1:]...)
+}
+
 // layout 是每帧入口。
 func (u *UI) layout(gtx layout.Context) {
+	// 后台选完的附件在这里并入界面状态（必须在 UI 线程改切片）。
+	if got := u.bridge.drainAttachments(); len(got) > 0 {
+		for _, a := range got {
+			if len(u.atts) >= maxAttachments {
+				break
+			}
+			dup := false
+			for _, old := range u.atts {
+				if old.Path == a.Path {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				u.atts = append(u.atts, a)
+			}
+		}
+	}
+
 	// 处理点击 / 提交事件
 	u.handleEvents(gtx)
 
@@ -360,7 +425,8 @@ func (u *UI) layout(gtx layout.Context) {
 	}
 	titleH := gtx.Dp(titleBarHeight)
 	barH := gtx.Dp(topBarHeight)
-	inputH := gtx.Dp(inputMinHeight)
+	// 有附件时输入卡片多一行 chip。
+	inputH := gtx.Dp(inputMinHeight) + u.attachExtraH(gtx)
 	// DSH CENTER_MIN = 400：右栏在场时中栏先保住 400，再决定右栏让出多少。
 	midW := W - navW - rightW
 	if midW < gtx.Dp(unit.Dp(400)) {
@@ -402,10 +468,16 @@ func (u *UI) layout(gtx layout.Context) {
 		u.drawActivePage(g, ap)
 	})
 	if ap.kind == pageChat {
+		u.composerBaseX = contentX
 		u.place(gtx, contentX, titleH+barH+chatH, contentW, inputH, func(g layout.Context) { u.drawInput(g) })
 	}
 	if rightW > 0 {
 		u.place(gtx, navW+midW, titleH, rightW, bodyH, func(g layout.Context) { u.drawRightPanel(g) })
+	}
+
+	// 输入区下拉菜单盖在页面之上、设置弹层之下。
+	if u.composerMenu != 0 {
+		u.drawComposerMenu(gtx)
 	}
 
 	// 设置弹层盖在页面上、重启提示之下。
@@ -679,6 +751,11 @@ func (u *UI) handleEvents(gtx layout.Context) {
 		u.handleSettingsModalEvents(gtx)
 		return
 	}
+	// 输入区的下拉菜单打开时，它盖住页面：先处理菜单项，再吃掉其余点击。
+	if u.composerMenu != 0 {
+		u.handleComposerMenu(gtx)
+		return
+	}
 
 	// 插件注册的脚部 / 顶栏动作：任何页面都能点（贡献条目自带页面目标或动作）。
 	u.handleContributionClicks(gtx)
@@ -724,6 +801,24 @@ func (u *UI) handleEvents(gtx layout.Context) {
 	}
 
 	if ap.kind == pageChat {
+		// 输入区选择器：点开对应下拉。
+		for i := 1; i <= 5; i++ {
+			if clickAt(&u.menuPills, i-1).Clicked(gtx) {
+				u.openComposerMenu(i)
+				return
+			}
+		}
+		// 附件：+ 选文件，附件 chip 点击移除。
+		if u.attachBtn.Clicked(gtx) {
+			u.pickAttachments()
+			return
+		}
+		for i := range u.atts {
+			if clickAt(&u.attachRemove, i).Clicked(gtx) {
+				u.removeAttachment(i)
+				return
+			}
+		}
 		if u.newSession.Clicked(gtx) {
 			u.bridge.newSession()
 		}
@@ -750,9 +845,11 @@ func (u *UI) handleEvents(gtx layout.Context) {
 		}
 		if send {
 			text := strings.TrimSpace(u.editor.Text())
-			if text != "" {
-				u.bridge.send(text)
+			// 只带附件不写字也是合理用法（"看看这个"）。
+			if text != "" || len(u.atts) > 0 {
+				u.bridge.send(text, u.workMode, u.reasoning, u.permission, u.atts)
 				u.editor.SetText("")
+				u.atts = nil
 			}
 		}
 		return

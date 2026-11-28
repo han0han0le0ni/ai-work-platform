@@ -9,11 +9,23 @@ import (
 	"time"
 )
 
+// UIOpener 是可选扩展：核心若支持「按需把界面插件重新拉起来」，就实现它。
+//
+// 典型场景：用户关掉 GUI 窗口后核心仍在后台运行（控制端口没释放），
+// 再点一次启动器时，启动器通过 /ui/open 让核心重新加载界面插件。
+type UIOpener interface {
+	OpenUI() (loaded bool, err error)
+}
+
 // ControlHandler 返回挂载在 <host>:<port> 上的控制通道。
 //
 // 格式化必须物理接触或预置 Token：
 //
 //	POST /format  Header: X-Format-Token: <core.json 中的 controlToken>
+//
+// 打开界面同样要求 Token：
+//
+//	POST /ui/open  Header: X-Format-Token: <core.json 中的 controlToken>
 //
 // 另提供 GET /health 与 GET /info 便于探测。
 func ControlHandler(h Host, token string) http.Handler {
@@ -38,6 +50,31 @@ func ControlHandler(h Host, token string) http.Handler {
 			time.Sleep(120 * time.Millisecond)
 			_ = Reset(h)
 		}()
+	})
+
+	mux.HandleFunc("/ui/open", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		given := r.Header.Get("X-Format-Token")
+		if token == "" || subtle.ConstantTimeCompare([]byte(given), []byte(token)) != 1 {
+			http.Error(w, "forbidden: token 不匹配", http.StatusForbidden)
+			return
+		}
+		opener, ok := h.(UIOpener)
+		if !ok {
+			http.Error(w, "这个核心不支持按需打开界面", http.StatusNotImplemented)
+			return
+		}
+		loaded, err := opener.OpenUI()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"ok":false,"error":%q}`, err.Error())
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true,"loaded":%t}`, loaded)
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {

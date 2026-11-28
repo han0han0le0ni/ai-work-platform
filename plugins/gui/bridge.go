@@ -8,6 +8,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 
 	"aiwork/sdk/go/plugin"
@@ -68,6 +72,11 @@ type snapshot struct {
 	Name      string
 	Note      string
 	Model     string
+	// ModelList 是 llm.v1 返回的可选模型名（输入区模型菜单用）。
+	ModelList []string
+	// ModelNote 是拉取模型清单失败时的原因，菜单里给用户一句提示，
+	// 否则"只有跟随当前配置"看起来像功能坏了。
+	ModelNote string
 	Sessions  []sessionInfo
 	Path      []msgView
 	Services  []serviceStatus
@@ -107,6 +116,24 @@ type bridge struct {
 	snap          snapshot
 	onChange      func() // 数据变化时通知 UI 重绘（由 Gio 的 invalidate 注入）
 	onPluginState func() // 插件状态变化时通知 UI 补拉当前页（由 UI 注入）
+
+	// pendingAttach 是后台线程选完、读好的附件，等 UI 线程取走后挂到输入框上。
+	// 文件对话框与读文件都在后台线程做，界面线程不能等它们。
+	pendingAttach []attachFile
+}
+
+// maxAttachments 是单条消息最多能带的附件数（chip 行一行放得下的数量）。
+const maxAttachments = 4
+
+// attachFile 是一个待发送的附件（形状与 conversation.v1 / agent.v1 一致）。
+type attachFile struct {
+	Type    string `json:"type"`              // text / image / file
+	Name    string `json:"name,omitempty"`    // 文件名
+	Text    string `json:"text,omitempty"`    // type=text：文件内容
+	DataURL string `json:"dataUrl,omitempty"` // type=image：data:image/png;base64,xxx
+	Size    int64  `json:"size,omitempty"`
+	// Path 只用于本机展示（chip 的 tooltip / 去重），不发给后端。
+	Path string `json:"-"`
 }
 
 func newBridge(ctx *plugin.Context) *bridge {
@@ -191,14 +218,156 @@ func (b *bridge) refresh() {
 	b.changed()
 }
 
+// ---------------------------------------------------------------
+// 附件：选文件 → 按类型读内容 → 交给 UI 挂到输入框
+// ---------------------------------------------------------------
+
+// pickAttachments 弹文件选择框并读取内容（后台线程，对话框阻塞也不影响界面）。
+func (b *bridge) pickAttachments(initial string) {
+	b.async(func() {
+		raw, err := b.ctx.Capability("core.shell.pickfiles", map[string]any{
+			"title":   "选择要附加的文件",
+			"initial": initial,
+		})
+		if err != nil {
+			b.patch(func(s *snapshot) { s.Note = "选择文件失败: " + err.Error() })
+			return
+		}
+		var out struct {
+			Paths     []string `json:"paths"`
+			Cancelled bool     `json:"cancelled"`
+		}
+		_ = json.Unmarshal(raw, &out)
+		if out.Cancelled || len(out.Paths) == 0 {
+			return
+		}
+		got := make([]attachFile, 0, len(out.Paths))
+		for _, p := range out.Paths {
+			if len(got) >= maxAttachments {
+				break
+			}
+			att, err := b.readAttachment(p)
+			if err != nil {
+				b.patch(func(s *snapshot) { s.Note = "读取附件失败: " + err.Error() })
+				continue
+			}
+			got = append(got, att)
+		}
+		if len(got) == 0 {
+			return
+		}
+		b.mu.Lock()
+		b.pendingAttach = append(b.pendingAttach, got...)
+		b.mu.Unlock()
+		b.changed()
+	})
+}
+
+// drainAttachments 由 UI 线程取走后台读好的附件。
+func (b *bridge) drainAttachments() []attachFile {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := b.pendingAttach
+	b.pendingAttach = nil
+	return out
+}
+
+// readAttachment 读一个文件，翻译成 message attachment。
+//
+// 规则与工作区里的附件一致：图片按 base64 让模型"看见"，文本读正文，
+// 其余类型（视频、压缩包等）只带文件名和大小，模型至少知道有这个文件。
+func (b *bridge) readAttachment(path string) (attachFile, error) {
+	name := filepath.Base(path)
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		var out struct {
+			Content   string `json:"content"`
+			Size      int64  `json:"size"`
+			Truncated bool   `json:"truncated"`
+		}
+		raw, err := b.ctx.Capability("core.fs.read", map[string]any{
+			"path": path, "encoding": "base64", "limit": 2 << 20,
+		})
+		if err != nil {
+			return attachFile{}, err
+		}
+		_ = json.Unmarshal(raw, &out)
+		mime := "image/png"
+		switch ext {
+		case ".jpg", ".jpeg":
+			mime = "image/jpeg"
+		case ".gif":
+			mime = "image/gif"
+		case ".webp":
+			mime = "image/webp"
+		case ".bmp":
+			mime = "image/bmp"
+		}
+		return attachFile{
+			Type: "image", Name: name, Path: path, Size: out.Size,
+			DataURL: "data:" + mime + ";base64," + out.Content,
+		}, nil
+	}
+	if textExts[ext] {
+		var out struct {
+			Content   string `json:"content"`
+			Size      int64  `json:"size"`
+			Truncated bool   `json:"truncated"`
+		}
+		raw, err := b.ctx.Capability("core.fs.read", map[string]any{
+			"path": path, "limit": 256 << 10,
+		})
+		if err != nil {
+			return attachFile{}, err
+		}
+		_ = json.Unmarshal(raw, &out)
+		text := out.Content
+		if out.Truncated {
+			text += "\n\n[文件超过 256KB，内容已截断]"
+		}
+		return attachFile{Type: "text", Name: name, Path: path, Size: out.Size, Text: text}, nil
+	}
+	var size int64
+	if info, err := os.Stat(path); err == nil {
+		size = info.Size()
+	}
+	return attachFile{Type: "file", Name: name, Path: path, Size: size}, nil
+}
+
+// textExts 是"按纯文本读给模型"的扩展名白名单。
+// 用白名单而不是"猜编码"：把二进制文件强行当文本读，模型只会看到一堆乱码。
+var textExts = map[string]bool{
+	".txt": true, ".md": true, ".markdown": true, ".log": true, ".csv": true,
+	".json": true, ".jsonl": true, ".yaml": true, ".yml": true, ".toml": true,
+	".ini": true, ".conf": true, ".cfg": true, ".env": true, ".xml": true,
+	".html": true, ".htm": true, ".css": true, ".scss": true,
+	".js": true, ".jsx": true, ".ts": true, ".tsx": true, ".vue": true,
+	".py": true, ".go": true, ".rs": true, ".java": true, ".kt": true,
+	".c": true, ".h": true, ".cpp": true, ".hpp": true, ".cs": true,
+	".sh": true, ".ps1": true, ".bat": true, ".sql": true, ".mod": true,
+}
+
 // send 发一条消息（异步：调 send 会阻塞到模型回复完成，放到后台）。
-func (b *bridge) send(text string) {
+func (b *bridge) send(text, mode, reasoning, permission string, atts []attachFile) {
 	b.mu.RLock()
 	sid := b.snap.SessionID
 	b.mu.RUnlock()
 
 	go func() {
 		params := map[string]any{"sessionId": sid, "text": text}
+		if mode != "" {
+			params["mode"] = mode
+		}
+		if reasoning != "" {
+			params["reasoningEffort"] = reasoning
+		}
+		if permission != "" {
+			params["permission"] = permission
+		}
+		if len(atts) > 0 {
+			params["attachments"] = atts
+		}
 		_, _ = b.conv("send", params)
 		b.refresh()
 	}()
@@ -320,6 +489,48 @@ func (b *bridge) model() string {
 		return out.Provider
 	}
 	return out.Provider + " · " + out.Model
+}
+
+// loadModels 拉当前提供商的可用模型清单，供输入区的模型选择器使用。
+func (b *bridge) loadModels() {
+	b.async(func() {
+		if _, err := b.ctx.Consume("llm.v1"); err != nil {
+			b.patch(func(s *snapshot) { s.ModelNote = "LLM 插件不在线" })
+			return
+		}
+		raw, err := b.ctx.Invoke("llm.v1", "models", map[string]any{})
+		if err != nil {
+			b.patch(func(s *snapshot) { s.ModelNote = err.Error() })
+			return
+		}
+		var out struct {
+			Models []string `json:"models"`
+		}
+		if json.Unmarshal(raw, &out) != nil {
+			b.patch(func(s *snapshot) { s.ModelNote = "模型清单解析失败" })
+			return
+		}
+		sort.Strings(out.Models)
+		b.patch(func(s *snapshot) {
+			s.ModelList = out.Models
+			s.ModelNote = ""
+		})
+	})
+}
+
+// setModel 切换当前模型（写入 llm.v1 的活动配置），并刷新顶栏显示。
+func (b *bridge) setModel(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	b.async(func() {
+		if _, err := b.ctx.Invoke("llm.v1", "configure", map[string]any{"model": name}); err != nil {
+			return
+		}
+		m := b.model()
+		b.patch(func(s *snapshot) { s.Model = m })
+	})
 }
 
 // plugins 拉已安装插件清单。

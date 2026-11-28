@@ -107,6 +107,9 @@ type chatReq struct {
 	Temperature *float64
 	MaxTokens   int
 	System      string
+	// ReasoningEffort 是推理强度（low / medium / high）；空表示跟随模型默认。
+	// 只有 OpenAI 兼容接口会把它写进请求体（reasoning_effort）。
+	ReasoningEffort string
 }
 
 // chatResp 是一次模型响应（内部统一格式）。
@@ -342,6 +345,9 @@ func openaiChat(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
+	}
+	if req.ReasoningEffort != "" {
+		body["reasoning_effort"] = req.ReasoningEffort
 	}
 
 	headers := map[string]string{}

@@ -26,7 +26,14 @@ Write-Host "==> building core"
 go build -trimpath -o (Join-Path $rt ("core" + $bin)) ./core
 
 function Build-GoPlugin($name) {
-  $dir = Join-Path $rt ("plugins\" + $name + ".plugin")
+  $enabled = Join-Path $rt ("plugins\" + $name + ".plugin")
+  $disabled = $enabled + ".disabled"
+  # 用户停用过的插件目录带 .disabled：继续往那个目录里构建，别重新造一个启用副本，
+  # 否则同一个插件会同时存在 x.plugin 与 x.plugin.disabled，启停就再也切不动了。
+  $dir = $enabled
+  if (-not (Test-Path $enabled) -and (Test-Path $disabled)) {
+    $dir = $disabled
+  }
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   Write-Host ("==> building go plugin: " + $name)
   go build -trimpath -o (Join-Path $dir ("main" + $bin)) ("./plugins/" + $name)
@@ -70,6 +77,38 @@ Build-GoPlugin "usage-monitor" | Out-Null
 # Default UI: the native Gio desktop GUI. It replaces the old terminal UI
 # (aurora) and the browser UI (webui); neither is shipped in runtime/plugins.
 Build-GoPlugin "gui" | Out-Null
+
+# ---------------------------------------------------------------------------
+# Rust (optional): build the SDK example when cargo is on PATH.
+# sdk/rust is a full fifth SDK; the echo example proves a Rust binary loads
+# just like Go / Python / Java / C ones. No cargo -> skip, never fail the build.
+# ---------------------------------------------------------------------------
+
+$cargo = Get-Command cargo -ErrorAction SilentlyContinue
+if ($cargo) {
+  Write-Host "==> building rust plugin: echo"
+  $rustTarget = Join-Path $root "dist\rust"
+  $oldTarget = $env:CARGO_TARGET_DIR
+  $env:CARGO_TARGET_DIR = $rustTarget
+  try {
+    cargo build --release --manifest-path (Join-Path $root "sdk\rust\Cargo.toml") --example echo
+    $dst = Join-Path $rt "plugins\echo-rust.plugin"
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    $rustBin = if ($bin -eq ".exe") { "echo.exe" } else { "echo" }
+    Copy-Item (Join-Path $rustTarget ("release\examples\" + $rustBin)) (Join-Path $dst ("main" + $bin)) -Force
+    Copy-Item (Join-Path $root "sdk\rust\examples\echo\manifest.json") (Join-Path $dst "manifest.json") -Force
+  } catch {
+    Write-Warning ("rust example skipped: " + $_.Exception.Message)
+  } finally {
+    if ($null -eq $oldTarget) {
+      Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+    } else {
+      $env:CARGO_TARGET_DIR = $oldTarget
+    }
+  }
+} else {
+  Write-Host "==> cargo not found, skipping rust example"
+}
 
 # ---------------------------------------------------------------------------
 # 内置官方 UI 包：产物只落在 runtime/builtin/

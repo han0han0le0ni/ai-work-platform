@@ -16,7 +16,9 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -179,8 +181,9 @@ func (e *Executor) view(t Tool) toolView {
 
 func (e *Executor) execute(args json.RawMessage) (any, error) {
 	var in struct {
-		Name string          `json:"name"`
-		Args json.RawMessage `json:"args"`
+		Name       string          `json:"name"`
+		Args       json.RawMessage `json:"args"`
+		Permission string          `json:"permission"`
 	}
 	if err := json.Unmarshal(args, &in); err != nil {
 		return nil, plugin.Errorf(plugin.CodeInvalidParams, "参数非法: %v", err)
@@ -196,6 +199,10 @@ func (e *Executor) execute(args json.RawMessage) (any, error) {
 	}
 	// 必填参数在这里拦一道：错误信息会原样喂回模型，让它自己改参数重试
 	if err := validateArgs(t, toolArgs); err != nil {
+		return nil, err
+	}
+	// 权限由调用方（agent）按输入区的选择透传，在这里真正拦截。
+	if err := e.checkPermission(t, toolArgs, in.Permission); err != nil {
 		return nil, err
 	}
 
@@ -269,6 +276,100 @@ func validateArgs(t Tool, args json.RawMessage) error {
 			"工具 %s 缺少必填参数：%s", t.Name, strings.Join(missing, "、"))
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 权限：只读 / 工作区内修改 / 不受限
+// ---------------------------------------------------------------------------
+
+// writeToolPattern 按工具名判断是不是「会改动文件」的工具。
+// 出厂目录里只有 write_file；注册工具按同样命名习惯兜底。
+var writeToolPattern = regexp.MustCompile(`(?i)(write|delete|remove|move|rename|copy|mkdir|create|edit|append|exec|shell|patch|update)`)
+
+func (e *Executor) checkPermission(t Tool, args json.RawMessage, mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "unrestricted":
+		return nil
+	case "readonly":
+		if writeToolPattern.MatchString(t.Name) {
+			return plugin.Errorf(plugin.CodePermissionDenied, "当前权限为只读，已拒绝工具 %s", t.Name)
+		}
+		return nil
+	case "workspace":
+		if !writeToolPattern.MatchString(t.Name) {
+			return nil
+		}
+		path := firstPathArg(args)
+		if path == "" {
+			return plugin.Errorf(plugin.CodePermissionDenied,
+				"当前权限限制在工作区内，工具 %s 没有提供 path 参数，已拒绝", t.Name)
+		}
+		root := e.workspaceRoot()
+		if root == "" {
+			return plugin.Errorf(plugin.CodePermissionDenied,
+				"当前权限限制在工作区内，但还没有选择工作区（输入区左侧的文件夹按钮）")
+		}
+		if !pathWithin(root, path) {
+			return plugin.Errorf(plugin.CodePermissionDenied,
+				"路径 %s 不在工作区 %s 内，已拒绝（把权限改成「不受限」或换到工作区内）", path, root)
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
+// workspaceRoot 问 workspace.v1 当前工作区；没装或没设置时返回空串。
+func (e *Executor) workspaceRoot() string {
+	if _, err := e.ctx.Consume("workspace.v1"); err != nil {
+		return ""
+	}
+	raw, err := e.ctx.Invoke("workspace.v1", "root", nil)
+	if err != nil {
+		return ""
+	}
+	var out struct {
+		Root string `json:"root"`
+		Set  bool   `json:"set"`
+	}
+	if json.Unmarshal(raw, &out) != nil || !out.Set {
+		return ""
+	}
+	return strings.TrimSpace(out.Root)
+}
+
+// firstPathArg 从工具参数里找路径字段。不同工具叫法不同，按常见顺序找。
+func firstPathArg(args json.RawMessage) string {
+	var obj map[string]any
+	if json.Unmarshal(args, &obj) != nil {
+		return ""
+	}
+	for _, key := range []string{"path", "target", "dest", "to", "file"} {
+		if v, ok := obj[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// pathWithin 判断绝对路径是否落在 root 里；相对路径一律放行（由工作区解析到 root 下）。
+func pathWithin(root, p string) bool {
+	if !filepath.IsAbs(p) {
+		return true
+	}
+	ra, err1 := filepath.Abs(root)
+	pa, err2 := filepath.Abs(p)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		ra, pa = strings.ToLower(ra), strings.ToLower(pa)
+	}
+	rel, err := filepath.Rel(ra, pa)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
 func (e *Executor) unknownTool(name string) error {

@@ -173,6 +173,10 @@ type turn struct {
 	payload   map[string]any
 	// attachments 随本次请求一起发给模型，但不落进树。
 	attachments []attachment
+	// 本次请求的模型行为选项（来自输入区选择器）。
+	mode            string
+	reasoningEffort string
+	permission      string
 }
 
 // begin 在锁内跑一次树改动，并把「该喂模型什么」一并算好带出来。
@@ -204,7 +208,7 @@ func (c *Conversation) begin(requested string, fn func(s *Session) (parentID str
 
 // finish 调模型，并把回复落成一条 assistant 节点。
 func (c *Conversation) finish(t turn) (map[string]any, error) {
-	content, via, gerr := c.dispatch(t.messages, t.system, t.attachments)
+	content, via, gerr := c.dispatch(t.messages, t.system, t.attachments, t.mode, t.reasoningEffort, t.permission)
 	errMsg := ""
 	if gerr != nil {
 		errMsg = gerr.Error()
@@ -409,6 +413,11 @@ type sendParams struct {
 	SessionID string `json:"sessionId,omitempty"`
 	Text      string `json:"text"`
 	System    string `json:"system,omitempty"`
+	// 单次发送的模型行为选项：工作模式、推理程度、工具权限。
+	// 只作用于这一次请求，不写进会话树（用户随时可以在输入区改）。
+	Mode            string `json:"mode,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	Permission      string `json:"permission,omitempty"`
 	// Attachments 是随这条消息一起发出的文件 / 图片。
 	//
 	// 只进这一次请求，**不进会话树**：图片的 base64 动辄几 MB，
@@ -456,6 +465,9 @@ func (c *Conversation) send(args json.RawMessage) (any, error) {
 		return nil, err
 	}
 	t.attachments = in.Attachments
+	t.mode = strings.TrimSpace(in.Mode)
+	t.reasoningEffort = strings.TrimSpace(in.ReasoningEffort)
+	t.permission = strings.TrimSpace(in.Permission)
 	return c.finish(t)
 }
 
@@ -676,7 +688,7 @@ func (c *Conversation) export(args json.RawMessage) (any, error) {
 //
 // agent 报错就原样返回，不再往 llm 降级 —— 那是一次真实失败，
 // 悄悄换成另一次调用只会让问题更难查（与 session 插件同一策略）。
-func (c *Conversation) dispatch(msgs []modelMessage, system string, atts []attachment) (string, string, error) {
+func (c *Conversation) dispatch(msgs []modelMessage, system string, atts []attachment, mode, reasoningEffort, permission string) (string, string, error) {
 	if len(msgs) == 0 {
 		return "", "", plugin.Errorf(plugin.CodeInvalidParams, "没有可发送的消息")
 	}
@@ -686,6 +698,15 @@ func (c *Conversation) dispatch(msgs []modelMessage, system string, atts []attac
 	}
 	if len(atts) > 0 {
 		params["attachments"] = atts
+	}
+	if mode != "" {
+		params["mode"] = mode
+	}
+	if reasoningEffort != "" {
+		params["reasoningEffort"] = reasoningEffort
+	}
+	if permission != "" {
+		params["permission"] = permission
 	}
 
 	if c.available(agentService) {

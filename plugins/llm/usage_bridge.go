@@ -54,6 +54,9 @@ func openaiChatMetered(l *LLM, req *chatReq, cfg *settings) (*chatResp, error) {
 	if len(req.Tools) > 0 {
 		body["tools"] = meteredTools(req.Tools)
 	}
+	if req.ReasoningEffort != "" {
+		body["reasoning_effort"] = req.ReasoningEffort
+	}
 
 	headers := map[string]string{}
 	if cfg.APIKey != "" {

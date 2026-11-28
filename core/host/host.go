@@ -318,6 +318,52 @@ func (h *Host) BuiltinUIPath() string {
 // 生命周期
 // ---------------------------------------------------------------------------
 
+// uiPluginID 是负责原生界面的官方插件。核心只认识这个约定 ID，
+// 不关心它内部用什么 UI 技术。
+const uiPluginID = "com.official.gui"
+
+// OpenUI 在核心仍于后台运行、而界面进程已经退出时，把界面插件重新拉起来。
+//
+// 返回 loaded=false 表示界面本来就在运行，无需重复加载。实现 format.UIOpener，
+// 由控制通道的 POST /ui/open 调用（启动器在用户再次双击图标时触发）。
+func (h *Host) OpenUI() (bool, error) {
+	if p := h.sup.Get(uiPluginID); p != nil {
+		if p.Alive() {
+			return false, nil
+		}
+		// 界面进程已经退出：先摘掉僵尸实例和它残留的服务，再重新启动。
+		h.unloadPlugin(uiPluginID)
+	}
+
+	discs, err := loader.Scan(h.PluginsDir())
+	if err != nil {
+		return false, fmt.Errorf("扫描插件目录失败: %w", err)
+	}
+	var target *loader.Discovery
+	for i := range discs {
+		if discs[i].ID() == uiPluginID {
+			target = &discs[i]
+			break
+		}
+	}
+	if target == nil {
+		return false, fmt.Errorf("未找到界面插件 %s", uiPluginID)
+	}
+	if target.Err != nil {
+		return false, fmt.Errorf("界面插件不可用: %w", target.Err)
+	}
+	for _, svc := range target.Manifest.Consumes {
+		if _, ok := h.reg.Lookup(svc); !ok {
+			return false, fmt.Errorf("界面插件缺少依赖服务 %s", svc)
+		}
+	}
+	h.logs.Core("info", "按需重新加载界面插件 %s", uiPluginID)
+	if err := h.startPlugin(*target); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Start 扫描并加载 plugins/ 下的所有插件。
 func (h *Host) Start() error {
 	h.cleanPendingDelete()
@@ -470,6 +516,8 @@ func (h *Host) Run() error {
 		h.control = closer
 		h.logs.Core("info", "格式化控制通道：POST http://%s:%d/format（Header X-Format-Token）",
 			h.cfg.ControlHost, h.cfg.ControlPort)
+		h.logs.Core("info", "打开界面通道：POST http://%s:%d/ui/open（Header X-Format-Token）",
+			h.cfg.ControlHost, h.cfg.ControlPort)
 	}
 
 	h.watchSignals()
@@ -566,8 +614,22 @@ func (h *Host) applyPendingToggle(c loader.Change, logf func(string, string, ...
 		return
 	}
 	if _, err := os.Lstat(to); err == nil {
-		logf("warn", "%s %s 失败：目标 %s 已存在", c.Action, c.Dir, filepath.Base(to))
-		return
+		// 同一插件可能同时存在 x.plugin 与 x.plugin.disabled（停用后又被构建重新生成）。
+		// 以启用中的那份为准，否则改名永远因“目标已存在”失败。
+		if c.Action == "disable" {
+			if rmErr := os.RemoveAll(to); rmErr != nil {
+				logf("warn", "禁用 %s 失败：清理旧的停用副本 %s 出错：%v", c.Dir, filepath.Base(to), rmErr)
+				return
+			}
+			logf("info", "禁用 %s：已清理旧的停用副本 %s", c.Dir, filepath.Base(to))
+		} else {
+			if rmErr := os.RemoveAll(from); rmErr != nil {
+				logf("warn", "启用 %s 失败：清理重复的停用副本出错：%v", c.Dir, rmErr)
+				return
+			}
+			logf("info", "启用 %s：目标已存在，已清理重复的停用副本", c.Dir)
+			return
+		}
 	}
 	if err := os.Rename(from, to); err != nil {
 		logf("warn", "%s %s 失败：%v", c.Action, c.Dir, err)

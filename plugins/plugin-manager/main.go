@@ -578,6 +578,31 @@ func (m *Manager) setEnabled(args json.RawMessage, enable bool) (any, error) {
 		action = "enable"
 	}
 
+	// 目录可能同时存在 x.plugin 与 x.plugin.disabled（停用后又被构建脚本重新生成）。
+	// 以启用中的那份为准：否则改名会因“目标已存在”失败，表现就是插件永远停不下来。
+	if enable && m.exists(to) {
+		if _, derr := m.deletePath(from, true); derr != nil {
+			return nil, plugin.Errorf(plugin.CodeInternalError, "清理重复的停用副本失败：%v", derr)
+		}
+		m.api.Log("info", "已启用插件（清理重复停用副本）", map[string]any{
+			"pluginId": target.info.ID,
+			"dir":      filepath.Base(to),
+		})
+		return map[string]any{
+			"pluginId":        target.info.ID,
+			"dir":             filepath.Base(to),
+			"enabled":         true,
+			"changed":         true,
+			"restartRequired": false,
+			"note":            "已启用：目标目录已存在，已清理重复的停用副本",
+		}, nil
+	}
+	if !enable && m.exists(to) {
+		if _, derr := m.deletePath(to, true); derr != nil {
+			return nil, plugin.Errorf(plugin.CodeInternalError, "清理旧的停用副本失败：%v", derr)
+		}
+	}
+
 	// 禁用前先热卸载：Windows 会锁住运行中插件的目录，不停进程连改名都会被拒。
 	// 卸载失败不阻断流程——后面改名失败仍会退回"标记待重启"。
 	unloaded := false

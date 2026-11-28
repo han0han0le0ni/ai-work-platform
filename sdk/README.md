@@ -1,10 +1,11 @@
 # 插件 SDK
 
-四套 SDK，同一份协议。**核心完全不感知插件是用什么语言写的**——它只看到 JSON-RPC over stdio 和一个 `manifest.json`。
+五套 SDK，同一份协议。**核心完全不感知插件是用什么语言写的**——它只看到 JSON-RPC over stdio 和一个 `manifest.json`。
 
 ```
 sdk/
 ├── go/plugin/      Go      —— 编译成原生二进制，runtime: binary
+├── rust/           Rust    —— 编译成原生二进制，runtime: binary
 ├── python/         Python  —— 单文件，runtime: python
 ├── java/           Java    —— 打成 jar，runtime: java
 └── c/              C99     —— 编译成原生二进制，runtime: binary
@@ -32,6 +33,7 @@ sdk/
 | SDK | 模型 | 说明 |
 |---|---|---|
 | Go | 读协程 + 每请求一协程 | handler 里可以直接 `Invoke`，响应由读协程收 |
+| Rust | 读线程 + 每请求一线程 | `Plugin` 放在 `Mutex` 里，同一插件的 handler 串行；handler 里可直接 `invoke` |
 | Python | 读线程 + 派发线程 + 每请求一线程 | 读线程只投递，绝不做业务 |
 | Java | 读线程 + 派发线程 + 线程池 | 同上 |
 | C | 单线程 + 可重入泵 | `aw_invoke` 会就地“泵”消息，期间到达的请求被递归处理 |
@@ -51,22 +53,22 @@ aw_fail(ctx, AW_SERVICE_NOT_FOUND, "..."); return NULL;        // C
 
 ## API 对照
 
-| 能力 | Go | Python | Java | C |
-|---|---|---|---|---|
-| 入口 | `plugin.Serve(&X{})` | `serve(X())` | `Serve.run(new X())` | `aw_serve(&plugin)` |
-| 激活 | `Activate(ctx)` | `activate(ctx)` | `activate(ctx)` | `plugin.activate` |
-| 处理调用 | `Handle(s,m,args)` | `handle(s,m,args)` | `handle(s,m,args)` | `plugin.handle` |
-| 退出清理 | `Deactivate()` | `deactivate()` | `deactivate()` | `plugin.deactivate` |
-| 注册服务 | `ctx.Provide(n,meta)` | `ctx.provide(n,meta)` | `ctx.provide(n,meta)` | `aw_provide(ctx,n,meta)` |
-| 发现服务 | `ctx.Consume(n)` | `ctx.consume(n)` | `ctx.consume(n)` | `aw_consume(ctx,n)` |
-| 调用服务 | `ctx.Invoke(s,m,args)` | `ctx.invoke(s,m,args)` | `ctx.invoke(s,m,args)` | `aw_invoke(ctx,s,m,args)` |
-| 发布事件 | `ctx.Emit(e,p)` | `ctx.emit(e,p)` | `ctx.emit(e,p)` | `aw_emit(ctx,e,p)` |
-| 订阅事件 | `ctx.On(e,h)` | `ctx.on(e,h)` | `ctx.on(e,h)` | `aw_on(ctx,e,fn)` |
-| 读配置 | `ctx.GetConfig(k)` | `ctx.get_config(k)` | `ctx.getConfig(k,def)` | `aw_get_config(ctx,k)` |
-| 写配置 | `ctx.SetConfig(k,v)` | `ctx.set_config(k,v)` | `ctx.setConfig(k,v)` | `aw_set_config(ctx,k,v)` |
-| 日志 | `ctx.Log(l,m,meta)` | `ctx.log(l,m,meta)` | `ctx.log(l,m,meta)` | `aw_log(ctx,l,m)` |
-| 能力代理 | `ctx.Capability(m,p)` | `ctx.capability(m,p)` | `ctx.capability(m,p)` | `aw_capability(ctx,m,p)` |
-| 沙箱 | `ctx.SandboxRun(...)` | `ctx.sandbox_run(...)` | `ctx.sandboxRun(...)` | `aw_sandbox_run(...)` |
+| 能力 | Go | Python | Java | C | Rust |
+|---|---|---|---|---|---|
+| 入口 | `plugin.Serve(&X{})` | `serve(X())` | `Serve.run(new X())` | `aw_serve(&plugin)` | `serve(Echo)` |
+| 激活 | `Activate(ctx)` | `activate(ctx)` | `activate(ctx)` | `plugin.activate` | `activate(&mut self, ctx)` |
+| 处理调用 | `Handle(s,m,args)` | `handle(s,m,args)` | `handle(s,m,args)` | `plugin.handle` | `handle(ctx,s,m,args)` |
+| 退出清理 | `Deactivate()` | `deactivate()` | `deactivate()` | `plugin.deactivate` | `deactivate(&mut self, ctx)` |
+| 注册服务 | `ctx.Provide(n,meta)` | `ctx.provide(n,meta)` | `ctx.provide(n,meta)` | `aw_provide(ctx,n,meta)` | `ctx.provide(n,meta)` |
+| 发现服务 | `ctx.Consume(n)` | `ctx.consume(n)` | `ctx.consume(n)` | `aw_consume(ctx,n)` | `ctx.consume(n)` |
+| 调用服务 | `ctx.Invoke(s,m,args)` | `ctx.invoke(s,m,args)` | `ctx.invoke(s,m,args)` | `aw_invoke(ctx,s,m,args)` | `ctx.invoke(s,m,args)` |
+| 发布事件 | `ctx.Emit(e,p)` | `ctx.emit(e,p)` | `ctx.emit(e,p)` | `aw_emit(ctx,e,p)` | `ctx.emit(e,p)` |
+| 订阅事件 | `ctx.On(e,h)` | `ctx.on(e,h)` | `ctx.on(e,h)` | `aw_on(ctx,e,fn)` | `ctx.on(e, 闭包)` |
+| 读配置 | `ctx.GetConfig(k)` | `ctx.get_config(k)` | `ctx.getConfig(k,def)` | `aw_get_config(ctx,k)` | `ctx.get_config(k)` |
+| 写配置 | `ctx.SetConfig(k,v)` | `ctx.set_config(k,v)` | `ctx.setConfig(k,v)` | `aw_set_config(ctx,k,v)` | `ctx.set_config(k,v)` |
+| 日志 | `ctx.Log(l,m,meta)` | `ctx.log(l,m,meta)` | `ctx.log(l,m,meta)` | `aw_log(ctx,l,m)` | `ctx.log(l,m,None)` |
+| 能力代理 | `ctx.Capability(m,p)` | `ctx.capability(m,p)` | `ctx.capability(m,p)` | `aw_capability(ctx,m,p)` | `ctx.capability(m,p)` |
+| 沙箱 | `ctx.SandboxRun(...)` | `ctx.sandbox_run(...)` | `ctx.sandboxRun(...)` | `aw_sandbox_run(...)` | `ctx.sandbox_run(...)` |
 
 能力代理还额外提供 `fsRead` / `fsWrite` / `fsList` / `netRequest` / `spawn` 的便捷封装。
 
@@ -193,6 +195,50 @@ tcc -I sdk/c -o main.exe main.c sdk/c/aiwork_plugin.c
 
 内存规则：**构造函数（`aj_obj` / `aj_str` / ...）产出的值所有权转移给容器；`aj_invoke` / `aw_get_config` 返回的值由调用方 `aj_free`；handler 的返回值由 SDK 释放。**
 
+### Rust
+
+```rust
+use aiwork_plugin::{json, serve, Context, Plugin, RpcError, RpcResult, Value};
+
+struct Echo;
+
+impl Plugin for Echo {
+    fn activate(&mut self, ctx: &Context) -> RpcResult<()> {
+        ctx.provide("echoRust.v1", json!({ "description": "回显" }))
+    }
+    fn handle(&mut self, _ctx: &Context, service: &str, method: &str, args: Value) -> RpcResult<Value> {
+        if method != "run" {
+            return Err(RpcError::method_not_found("不支持的方法"));
+        }
+        Ok(json!({ "echo": args.get("text").cloned().unwrap_or(Value::Null) }))
+    }
+}
+
+fn main() { serve(Echo).expect("插件异常退出"); }
+```
+
+```json
+{ "entry": "main", "runtime": "binary", "provides": ["echoRust.v1"] }
+```
+
+引用 SDK（`sdk/rust` 是一个普通 crate，按路径依赖即可）：
+
+```toml
+[dependencies]
+aiwork-plugin = { path = "../../sdk/rust" }
+serde_json = "1"
+```
+
+```sh
+cargo build --release
+# Windows 拷 main.exe，其他平台拷 main
+cp target/release/你的插件 runtime/plugins/echo-rust.plugin/main
+```
+
+仓库里有一份可直接跑的示例：`sdk/rust/examples/echo/`。
+`cargo build --release --example echo` 会在 `target/release/examples/` 下产出二进制；
+`build.ps1` 检测到 `cargo` 时会顺手把它装成 `runtime/plugins/echo-rust.plugin/`。
+
 ## runtime 字段
 
 | runtime | 核心如何启动插件 |
@@ -210,4 +256,4 @@ tcc -I sdk/c -o main.exe main.c sdk/c/aiwork_plugin.c
 仓库里的官方插件目前都是 Go 写的（`fs-tool` / `llm` / `agent` / `session` / `workbench` / `plugin-manager` / `workspace`）。
 上面各语言那一小段 `Echo` 代码，就是对应 SDK 的**最小示例** —— 照抄即可得到一个能加载的插件，
 核心不关心它用什么语言写：把任一语言的 `Echo` 编出来放进 `plugins/<名字>.plugin/` 就能加载，
-四种语言走的是同一份协议。
+五种语言走的是同一份协议。

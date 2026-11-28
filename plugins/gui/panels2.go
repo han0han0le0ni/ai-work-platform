@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -452,10 +453,10 @@ func wrapText(s string, width int) []string {
 	return out
 }
 
-// drawInput 底部输入卡片（对照 DSH InputBar .card）：
-// 最大宽 952dp 居中，radius 28，0.5px 描边；上排输入、下排工具行 + 34px 圆形发送。
+// drawInput 底部输入卡片（对齐 DSH InputBar）：
+// radius 28、8px 上内边、正文在上、工具行在下；最大宽 952dp 居中。
 func (u *UI) drawInput(gtx layout.Context) layout.Dimensions {
-	h := gtx.Dp(inputMinHeight)
+	h := gtx.Dp(inputMinHeight) + u.attachExtraH(gtx)
 	gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
 	fill(gtx, cBg)
 
@@ -465,59 +466,493 @@ func (u *UI) drawInput(gtx layout.Context) layout.Dimensions {
 		if max := gtx.Dp(unit.Dp(composerMaxW)); cardW > max {
 			cardW = max
 		}
+		// 记下卡片左边缘的窗口坐标，供下拉菜单贴住 chip。
+		u.composerCardX = u.composerBaseX + gtx.Dp(unit.Dp(16)) + (gtx.Constraints.Max.X-cardW)/2
 		return u.centerWidth(gtx, cardW, func(gtx layout.Context) layout.Dimensions {
 			w := gtx.Constraints.Max.X
 			ch := gtx.Constraints.Max.Y
 			gtx.Constraints = layout.Exact(image.Pt(w, ch))
-			drawRBoxOutline(gtx, cPanelAlt, cBorder, unit.Dp(radiusPanel), w, ch)
-			return layout.Inset{Left: unit.Dp(14), Right: unit.Dp(8), Top: unit.Dp(12), Bottom: unit.Dp(6)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			drawRBoxOutline(gtx, cPanelAlt, cBorderLift, unit.Dp(radiusPanel), w, ch)
+			// DSH 的卡片只留上/下内边，左右内边由正文和工具行自己带。
+			return layout.Inset{Top: unit.Dp(10), Bottom: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				children := []layout.FlexChild{
 					layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return u.composerEditor(gtx) }),
+				}
+				if len(u.atts) > 0 {
+					children = append(children,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return u.composerAttachments(gtx)
+						}),
+					)
+				}
+				children = append(children,
+					layout.Rigid(layout.Spacer{Height: unit.Dp(10)}.Layout),
 					layout.Rigid(func(gtx layout.Context) layout.Dimensions { return u.composerTools(gtx) }),
 				)
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 			})
 		})
 	})
 }
 
-// composerEditor 输入区：14/24 正文，最多约 3 行后内部滚动由 Editor 负责。
+// composerEditor 输入区：DSH .input —— 14/24 正文，左 16 右 12、上 8。
 func (u *UI) composerEditor(gtx layout.Context) layout.Dimensions {
-	minH := gtx.Dp(unit.Dp(36))
-	gtx.Constraints.Min.Y = minH
-	ed := material.Editor(u.th, &u.editor, "输入消息，Enter 发送…")
+	ed := material.Editor(u.th, &u.editor, "输入消息，Enter 发送，Shift+Enter 换行")
 	ed.TextSize = unit.Sp(14)
 	ed.Color = cText
 	ed.HintColor = cTextFaint
-	return layout.Inset{Top: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
-		return ed.Layout(gtx)
+	return layout.Inset{Left: unit.Dp(16), Right: unit.Dp(12), Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				gtx.Constraints.Min.Y = gtx.Dp(unit.Dp(46))
+				return ed.Layout(gtx)
+			}),
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				return layout.Dimensions{Size: image.Pt(gtx.Constraints.Min.X, gtx.Constraints.Min.Y)}
+			}),
+		)
 	})
 }
 
-// composerTools 工具行：左提示、右 34px 圆形发送（DSH .row + .primary）。
+// composerTools 工具行（DSH .row）：左侧权限 / 模式 / 工作区，右侧推理 / 模型 / 发送。
+//
+// 这里不按 Flex 排，而是先把每个 chip 录成宏量出宽度、再左右两端定位：
+// 一是右组要严格贴右，二是顺手拿到每个 chip 的横坐标，让下拉菜单能像
+// DSH popover 一样贴着触发的 chip 弹出，而不是永远居中。
 func (u *UI) composerTools(gtx layout.Context) layout.Dimensions {
 	h := gtx.Dp(unit.Dp(34))
-	gtx.Constraints.Min.Y = h
-	gtx.Constraints.Max.Y = h
-	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return label(gtx, u.th, "Enter 发送 · Shift+Enter 换行", unit.Sp(12), cTextFaint)
-		}),
-		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions { return layout.Dimensions{Size: gtx.Constraints.Min} }),
-		layout.Rigid(func(gtx layout.Context) layout.Dimensions { return u.sendCircle(gtx) }),
-	)
+	W := gtx.Constraints.Max.X
+	gtx.Constraints = layout.Exact(image.Pt(W, h))
+	snap := u.bridge.get()
+	model := snap.Model
+	if model == "" {
+		model = "未连接模型"
+	}
+	name := currentModelName(model)
+	if name == "" {
+		name = model
+	}
+
+	type chip struct {
+		kind  int
+		macro op.CallOp
+		w     int
+	}
+	makeChip := func(kind int, txt string) chip {
+		macro := op.Record(gtx.Ops)
+		c := gtx
+		c.Constraints = layout.Constraints{Max: image.Pt(W, h)}
+		d := u.composerPill(c, kind, txt)
+		return chip{kind: kind, macro: macro.Stop(), w: d.Size.X}
+	}
+
+	padX := gtx.Dp(unit.Dp(8))
+	gap := gtx.Dp(unit.Dp(8))
+	chipH := gtx.Dp(unit.Dp(28))
+	left := []chip{
+		makeChip(4, permissionLabel(u.permission)),
+		makeChip(1, modeLabel(u.workMode)),
+		makeChip(5, clipText(workspaceLabel(snap.Workspace.Root), 12)),
+	}
+	right := []chip{
+		makeChip(3, reasoningLabel(u.reasoning)),
+		makeChip(2, clipText(name, 16)),
+	}
+	sendD := gtx.Dp(unit.Dp(34))
+	attachD := gtx.Dp(unit.Dp(28))
+
+	// 窄窗口时左组可能顶到右组：先把工作区 chip 收起来（其余四个保留），
+	// 保证任何宽度下都不会出现两个 chip 叠在一起的文字。
+	rightStart := W - padX - sendD
+	for _, c := range right {
+		rightStart -= c.w + gap
+	}
+	leftEnd := padX + attachD + gap
+	for _, c := range left {
+		leftEnd += c.w + gap
+	}
+	if leftEnd > rightStart {
+		left = left[:len(left)-1]
+	}
+
+	place := func(mm op.CallOp, x, y int) {
+		off := op.Offset(image.Pt(x, y)).Push(gtx.Ops)
+		mm.Add(gtx.Ops)
+		off.Pop()
+	}
+	chipY := (h - chipH) / 2
+
+	// 最左边是 DSH 的圆形「+」：选文件作为附件。
+	attachOff := op.Offset(image.Pt(padX, (h-attachD)/2)).Push(gtx.Ops)
+	u.attachCircle(gtx)
+	attachOff.Pop()
+
+	x := padX + attachD + gap
+	for _, c := range left {
+		u.pillOffset[c.kind] = x
+		place(c.macro, x, chipY)
+		x += c.w + gap
+	}
+	sendX := W - padX - sendD
+	x = sendX - gap
+	for i := len(right) - 1; i >= 0; i-- {
+		c := right[i]
+		x -= c.w
+		u.pillOffset[c.kind] = x
+		place(c.macro, x, chipY)
+		x -= gap
+	}
+	placeSend := op.Offset(image.Pt(sendX, 0)).Push(gtx.Ops)
+	u.sendCircle(gtx)
+	placeSend.Pop()
+	return layout.Dimensions{Size: image.Pt(W, h)}
 }
 
+// attachCircle 输入框左下角的圆形「+」按钮（DSH .add）：打开文件选择。
+func (u *UI) attachCircle(gtx layout.Context) layout.Dimensions {
+	d := gtx.Dp(unit.Dp(28))
+	gtx.Constraints = layout.Exact(image.Pt(d, d))
+	return u.attachBtn.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		bg := cBtnFill
+		if u.attachBtn.Hovered() {
+			bg = cBtnHover
+		}
+		paint.FillShape(gtx.Ops, bg, clip.Ellipse(image.Rectangle{Max: image.Pt(d, d)}).Op(gtx.Ops))
+		l := material.Label(u.th, unit.Sp(16), "+")
+		l.Color = cTextDim
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return l.Layout(gtx)
+		})
+	})
+}
+
+// composerAttachments 是输入框与工具行之间的附件 chip 行：
+// 点 chip 即移除（DSH 的附件条也是点 ×/缩略图移除）。
+func (u *UI) composerAttachments(gtx layout.Context) layout.Dimensions {
+	h := gtx.Dp(unit.Dp(24))
+	gtx.Constraints = layout.Exact(image.Pt(gtx.Constraints.Max.X, h))
+	return layout.Inset{Left: unit.Dp(16), Right: unit.Dp(12), Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		children := make([]layout.FlexChild, 0, len(u.atts)*2)
+		for i := range u.atts {
+			idx := i
+			if i > 0 {
+				children = append(children, layout.Rigid(layout.Spacer{Width: unit.Dp(8)}.Layout))
+			}
+			children = append(children, layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return u.composerAttachChip(gtx, idx)
+			}))
+		}
+		return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx, children...)
+	})
+}
+
+// composerAttachChip 一个附件胶囊：图标 + 文件名 + ×。
+func (u *UI) composerAttachChip(gtx layout.Context, i int) layout.Dimensions {
+	a := u.atts[i]
+	h := gtx.Dp(unit.Dp(24))
+	gtx.Constraints.Min.Y = h
+	gtx.Constraints.Max.Y = h
+	b := clickAt(&u.attachRemove, i)
+	return b.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		macro := op.Record(gtx.Ops)
+		l := material.Label(u.th, unit.Sp(12), "▤ "+clipText(a.Name, 14)+"  ×")
+		l.Color = cTextDim
+		textDims := l.Layout(gtx)
+		textOps := macro.Stop()
+
+		pad := gtx.Dp(unit.Dp(8))
+		w := textDims.Size.X + pad*2
+		bg := cHoverLift
+		if b.Hovered() {
+			bg = cBtnHover
+		}
+		drawRBoxFill(gtx, bg, unit.Dp(6), w, h)
+		stack := op.Offset(image.Pt(pad, (h-textDims.Size.Y)/2)).Push(gtx.Ops)
+		textOps.Add(gtx.Ops)
+		stack.Pop()
+		return layout.Dimensions{Size: image.Pt(w, h)}
+	})
+}
+
+// composerPill 一个 28px 高的 chip（DSH .select / PermissionSelect .trigger）：
+// 13px 中等字重、次要色，8px 圆角，悬浮时叠一层浅底。
+func (u *UI) composerPill(gtx layout.Context, kind int, txt string) layout.Dimensions {
+	b := clickAt(&u.menuPills, kind-1)
+	h := gtx.Dp(unit.Dp(28))
+	gtx.Constraints.Min.Y = h
+	gtx.Constraints.Max.Y = h
+	return b.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		content := func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Left: unit.Dp(8), Right: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						l := material.Label(u.th, unit.Sp(13), txt)
+						l.Color = cTextDim
+						l.Font.Weight = 500
+						return l.Layout(gtx)
+					}),
+					layout.Rigid(layout.Spacer{Width: unit.Dp(4)}.Layout),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return label(gtx, u.th, "⌄", unit.Sp(11), cTextFaint)
+					}),
+				)
+			})
+		}
+		if b.Hovered() || u.composerMenu == kind {
+			return drawRBox(gtx, cHoverLift, unit.Dp(8), content)
+		}
+		return content(gtx)
+	})
+}
+
+// drawComposerMenu 输入区下拉：盖在页面之上，最多 8 行，超出内部滚动。
+func (u *UI) drawComposerMenu(gtx layout.Context) {
+	W, H := gtx.Constraints.Max.X, gtx.Constraints.Max.Y
+	// 全窗透明遮罩：点空白处关闭。
+	u.menuBackdrop.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Dimensions{Size: image.Pt(W, H)}
+	})
+
+	items := u.composerMenuItems()
+	if len(items) == 0 {
+		return
+	}
+	navW := gtx.Dp(navWidth)
+	rightW := 0
+	if u.showRight {
+		rightW = int(float64(W) * panelDefRatio)
+		if rightW < gtx.Dp(panelWidth) {
+			rightW = gtx.Dp(panelWidth)
+		}
+		if maxR := int(float64(W) * panelMaxRatio); rightW > maxR {
+			rightW = maxR
+		}
+	}
+	midW := W - navW - rightW
+	menuW := gtx.Dp(unit.Dp(240))
+	if menuW > midW-32 {
+		menuW = midW - 32
+	}
+	if menuW < gtx.Dp(unit.Dp(160)) {
+		menuW = gtx.Dp(unit.Dp(160))
+	}
+	// 贴着被点的 chip 弹出（DSH popover 行为）：左边缘对齐触发 chip，
+	// 越界时再夹回窗口内。
+	x := u.composerCardX + u.pillOffset[u.composerMenu]
+	if x < navW+gtx.Dp(unit.Dp(8)) {
+		x = navW + gtx.Dp(unit.Dp(8))
+	}
+	if x+menuW > W-gtx.Dp(unit.Dp(8)) {
+		x = W - gtx.Dp(unit.Dp(8)) - menuW
+	}
+
+	rowH := gtx.Dp(unit.Dp(32))
+	pad := gtx.Dp(unit.Dp(6))
+	visible := len(items)
+	if visible > 8 {
+		visible = 8
+	}
+	menuH := visible*rowH + pad*2
+	y := H - gtx.Dp(inputMinHeight) + gtx.Dp(unit.Dp(6)) - menuH
+	if y < 0 {
+		y = 0
+	}
+
+	u.place(gtx, x, y, menuW, menuH, func(g layout.Context) {
+		drawRBoxOutline(g, cPanel, cBorder, unit.Dp(radiusMd), menuW, menuH)
+		inner := g
+		inner.Constraints = layout.Exact(image.Pt(menuW, menuH-pad*2))
+		layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6)}.Layout(inner, func(gtx layout.Context) layout.Dimensions {
+			l := u.pageScroll["composer-menu"]
+			if l == nil {
+				l = &layout.List{Axis: layout.Vertical}
+				u.pageScroll["composer-menu"] = l
+			}
+			return l.Layout(gtx, len(items), func(gtx layout.Context, i int) layout.Dimensions {
+				return u.settingsDropdownRow(gtx, clickAt(&u.menuRows, i), items[i].Label, items[i].Active)
+			})
+		})
+	})
+}
+
+// composerMenuItem 下拉里的一行。
+type composerMenuItem struct {
+	Label  string
+	Active bool
+}
+
+// composerMenuItems 按当前打开的是哪一个选择器生成选项。
+func (u *UI) composerMenuItems() []composerMenuItem {
+	snap := u.bridge.get()
+	switch u.composerMenu {
+	case 1:
+		return []composerMenuItem{
+			{"工具模式（可调用工具）", u.workMode != "chat"},
+			{"聊天模式（只聊天）", u.workMode == "chat"},
+		}
+	case 2:
+		cur := currentModelName(snap.Model)
+		out := make([]composerMenuItem, 0, len(snap.ModelList)+2)
+		out = append(out, composerMenuItem{"跟随当前配置", cur == ""})
+		for _, m := range snap.ModelList {
+			out = append(out, composerMenuItem{m, m == cur})
+		}
+		// 取不到清单时给一句原因，别让下拉只剩一行看起来像坏了。
+		if len(snap.ModelList) == 0 && snap.ModelNote != "" {
+			out = append(out, composerMenuItem{"⚠ " + clipText(snap.ModelNote, 26), false})
+		}
+		return out
+	case 3:
+		return []composerMenuItem{
+			{"自动（跟随模型）", u.reasoning == ""},
+			{"低", u.reasoning == "low"},
+			{"中", u.reasoning == "medium"},
+			{"高", u.reasoning == "high"},
+		}
+	case 4:
+		return []composerMenuItem{
+			{"工作区内修改", u.permission == "workspace"},
+			{"只读", u.permission == "readonly"},
+			{"不受限", u.permission == "unrestricted"},
+		}
+	case 5:
+		return []composerMenuItem{{"选择文件夹…", false}}
+	}
+	return nil
+}
+
+// applyComposerChoice 应用下拉选择。
+func (u *UI) applyComposerChoice(i int) {
+	items := u.composerMenuItems()
+	if i < 0 || i >= len(items) {
+		return
+	}
+	switch u.composerMenu {
+	case 1:
+		if i == 0 {
+			u.workMode = "tools"
+		} else {
+			u.workMode = "chat"
+		}
+	case 2:
+		if i > 0 {
+			snap := u.bridge.get()
+			if i-1 < len(snap.ModelList) {
+				u.bridge.setModel(snap.ModelList[i-1])
+			}
+		}
+	case 3:
+		u.reasoning = []string{"", "low", "medium", "high"}[i]
+	case 4:
+		u.permission = []string{"workspace", "readonly", "unrestricted"}[i]
+	case 5:
+		u.bridge.pickWorkspaceRoot()
+	}
+}
+
+// openComposerMenu 打开某个选择器（1 模式 / 2 模型 / 3 推理 / 4 权限 / 5 工作区）。
+func (u *UI) openComposerMenu(kind int) {
+	u.composerMenu = kind
+	if l := u.pageScroll["composer-menu"]; l != nil {
+		l.Position = layout.Position{}
+	}
+	switch kind {
+	case 2:
+		u.bridge.loadModels()
+	case 5:
+		u.bridge.loadWorkspaceRoot()
+	}
+}
+
+// handleComposerMenu 处理下拉里的点击；点遮罩关闭。
+func (u *UI) handleComposerMenu(gtx layout.Context) {
+	n := len(u.composerMenuItems())
+	for i := 0; i < n; i++ {
+		if clickAt(&u.menuRows, i).Clicked(gtx) {
+			u.applyComposerChoice(i)
+			u.composerMenu = 0
+			return
+		}
+	}
+	if u.menuBackdrop.Clicked(gtx) {
+		u.composerMenu = 0
+	}
+}
+
+func modeLabel(v string) string {
+	if v == "chat" {
+		return "聊天模式"
+	}
+	return "工具模式"
+}
+
+func permissionLabel(v string) string {
+	switch v {
+	case "readonly":
+		return "只读"
+	case "unrestricted":
+		return "不受限"
+	}
+	return "工作区内修改"
+}
+
+func reasoningLabel(v string) string {
+	switch v {
+	case "low":
+		return "推理·低"
+	case "medium":
+		return "推理·中"
+	case "high":
+		return "推理·高"
+	}
+	return "推理·自动"
+}
+
+func workspaceLabel(root string) string {
+	if strings.TrimSpace(root) == "" {
+		return "选择工作区"
+	}
+	base := filepath.Base(strings.TrimRight(root, `\/`))
+	if base == "" || base == "." {
+		return root
+	}
+	return base
+}
+
+// currentModelName 从 "provider · model" 里取出模型名用于选中态比较。
+func currentModelName(model string) string {
+	if i := strings.LastIndex(model, " · "); i >= 0 {
+		return model[i+len(" · "):]
+	}
+	return model
+}
+
+func clipText(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
+// sendCircle 34px 圆形发送（DSH .primary）：空输入时按 0.4 透明度淡出，箭头恒为白色。
 func (u *UI) sendCircle(gtx layout.Context) layout.Dimensions {
 	d := gtx.Dp(unit.Dp(34))
 	gtx.Constraints = layout.Exact(image.Pt(d, d))
+	empty := strings.TrimSpace(u.editor.Text()) == "" && len(u.atts) == 0
 	bg := cAccent
-	if u.send.Hovered() {
+	if u.send.Hovered() && !empty {
 		bg = color.NRGBA{R: 0x9C, G: 0xC2, B: 0xFF, A: 0xFF}
+	}
+	fg := color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: 0xFF}
+	if empty {
+		bg.A = 0x66
+		fg.A = 0x99
 	}
 	paint.FillShape(gtx.Ops, bg, clip.Ellipse(image.Rectangle{Max: image.Pt(d, d)}).Op(gtx.Ops))
 	dims := layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		l := material.Label(u.th, unit.Sp(16), "↑")
-		l.Color = cBg
+		l.Color = fg
 		l.Font.Weight = 700
 		return l.Layout(gtx)
 	})

@@ -1,0 +1,14 @@
+{
+  "id": "com.example.echo-rust",
+  "name": "Rust Echo",
+  "description": "Rust SDK 示例插件：echoRust.v1 原样回显输入，用于验证第五套 SDK",
+  "version": "1.0.0",
+  "apiVersion": "1",
+  "entry": "main",
+  "runtime": "binary",
+  "provides": ["echoRust.v1"],
+  "permissions": [],
+  "compat": {
+    "core": ">=1.0 <2.0"
+  }
+}

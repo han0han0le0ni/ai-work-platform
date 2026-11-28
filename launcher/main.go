@@ -6,7 +6,7 @@
 //  1. 摆在项目根目录，文件名就是产品名，带图标（构建脚本给这个 exe 打了资源）
 //  2. 把控制台窗口标题改成产品名。核心只往 stderr 打一行启动信息、不管窗口，
 //     而窗口是启动器先开的，所以标题由启动器来改。
-//  3. 已经跑着一个实例时直接说清楚，不再开第二个去抢终端 / 抢设备。
+//  3. 已经跑着一个实例时不再开第二个：界面开着就置前，只剩后台就让核心补开界面。
 //  4. 转发退出码：核心怎么退，启动器就怎么退。
 //
 // 它不认识插件、不认识 JSON-RPC、不认识 UI。核心挪走了它就没用了。
@@ -16,7 +16,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,9 +52,7 @@ func run() error {
 	}
 
 	if addr, running := alreadyRunning(runtimeDir); running {
-		messageBox(appName, appName+" 已经在运行了（控制端口 "+addr+"）。\n\n"+
-			"先找找已经开着的那个窗口；确实没有的话，说明上次没退干净，\n"+
-			"把残留的 core 进程结束掉再启动。")
+		openExistingUI(runtimeDir, addr)
 		return nil
 	}
 
@@ -147,21 +147,7 @@ func mustGetwd() string {
 // alreadyRunning 借核心自己的控制端口判断有没有活着的实例。
 // 端口从 runtime/core.json 读，读不到就用默认值。
 func alreadyRunning(runtimeDir string) (string, bool) {
-	host, port := "127.0.0.1", defaultControlPort
-	if raw, err := os.ReadFile(filepath.Join(runtimeDir, "core.json")); err == nil {
-		var cfg struct {
-			ControlHost string `json:"controlHost"`
-			ControlPort int    `json:"controlPort"`
-		}
-		if json.Unmarshal(raw, &cfg) == nil {
-			if cfg.ControlHost != "" {
-				host = cfg.ControlHost
-			}
-			if cfg.ControlPort > 0 {
-				port = cfg.ControlPort
-			}
-		}
-	}
+	host, port, _ := readControlConfig(runtimeDir)
 	addr := net.JoinHostPort(host, fmt.Sprint(port))
 	conn, err := net.DialTimeout("tcp", addr, 400*time.Millisecond)
 	if err != nil {
@@ -169,6 +155,73 @@ func alreadyRunning(runtimeDir string) (string, bool) {
 	}
 	conn.Close()
 	return addr, true
+}
+
+// readControlConfig 读取核心的控制通道地址与令牌（core.json）。
+func readControlConfig(runtimeDir string) (host string, port int, token string) {
+	host, port = "127.0.0.1", defaultControlPort
+	raw, err := os.ReadFile(filepath.Join(runtimeDir, "core.json"))
+	if err != nil {
+		return host, port, ""
+	}
+	var cfg struct {
+		ControlHost  string `json:"controlHost"`
+		ControlPort  int    `json:"controlPort"`
+		ControlToken string `json:"controlToken"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return host, port, ""
+	}
+	if cfg.ControlHost != "" {
+		host = cfg.ControlHost
+	}
+	if cfg.ControlPort > 0 {
+		port = cfg.ControlPort
+	}
+	return host, port, cfg.ControlToken
+}
+
+// openExistingUI 处理「后台还在」的情况：
+//   - 界面窗口已经开着：直接置前
+//   - 只有后台、没有界面：请核心把界面插件重新拉起来，再等窗口出现
+func openExistingUI(runtimeDir, addr string) {
+	if focusExistingUI() {
+		return
+	}
+	if err := requestOpenUI(runtimeDir); err != nil {
+		messageBox(appName, appName+" 的后台正在运行（控制端口 "+addr+"），但界面没能打开。\n\n"+
+			err.Error()+"\n\n日志在 "+filepath.Join(runtimeDir, "logs")+"。")
+		return
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if focusExistingUI() {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	messageBox(appName, "已请求重新打开界面，但窗口没有出现。\n日志在 "+filepath.Join(runtimeDir, "logs")+"。")
+}
+
+// requestOpenUI 调核心的 POST /ui/open，让它在后台把界面插件重新加载起来。
+func requestOpenUI(runtimeDir string) error {
+	host, port, token := readControlConfig(runtimeDir)
+	url := fmt.Sprintf("http://%s/ui/open", net.JoinHostPort(host, fmt.Sprint(port)))
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Format-Token", token)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return fmt.Errorf("连接核心失败: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("核心返回 %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // pluginsExist 判断运行时是否已经装了插件（和核心 PluginsExist 同样的判据）。

@@ -8,7 +8,7 @@
   "runtime": "binary",
   "provides": ["gui.v1"],
   "consumes": ["conversation.v1", "session.v1", "agent.v1", "llm.v1", "toolExecutor.v1", "pluginManager.v1"],
-  "permissions": ["shell:pickfolder"],
+  "permissions": ["shell:pickfolder", "shell:pickfiles", "filesystem:read"],
   "compat": {
     "core": ">=1.0 <2.0"
   }

@@ -106,6 +106,8 @@ var KnownPermissions = []string{
 	"filesystem:delete",
 	"process:spawn",
 	"shell:open",
+	"shell:pickfolder",
+	"shell:pickfiles",
 	"sandbox:use",
 }
 

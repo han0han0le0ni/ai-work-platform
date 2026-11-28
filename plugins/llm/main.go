@@ -162,12 +162,13 @@ func (l *LLM) Deactivate() error {
 // ---------------------------------------------------------------------------
 
 type chatParams struct {
-	Messages    json.RawMessage `json:"messages"`
-	Tools       json.RawMessage `json:"tools,omitempty"`
-	System      string          `json:"system,omitempty"`
-	Model       string          `json:"model,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	MaxTokens   int             `json:"maxTokens,omitempty"`
+	Messages        json.RawMessage `json:"messages"`
+	Tools           json.RawMessage `json:"tools,omitempty"`
+	System          string          `json:"system,omitempty"`
+	Model           string          `json:"model,omitempty"`
+	Temperature     *float64        `json:"temperature,omitempty"`
+	MaxTokens       int             `json:"maxTokens,omitempty"`
+	ReasoningEffort string          `json:"reasoningEffort,omitempty"`
 }
 
 func (l *LLM) chat(args json.RawMessage) (any, error) {
@@ -225,12 +226,13 @@ func (l *LLM) chat(args json.RawMessage) (any, error) {
 	}
 
 	req := &chatReq{
-		Messages:    msgs,
-		Tools:       tools,
-		Model:       cfg.Model,
-		Temperature: cfg.Temperature,
-		MaxTokens:   cfg.MaxTokens,
-		System:      system,
+		Messages:        msgs,
+		Tools:           tools,
+		Model:           cfg.Model,
+		Temperature:     cfg.Temperature,
+		MaxTokens:       cfg.MaxTokens,
+		System:          system,
+		ReasoningEffort: strings.TrimSpace(in.ReasoningEffort),
 	}
 
 	start := time.Now()

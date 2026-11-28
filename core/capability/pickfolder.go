@@ -71,14 +71,33 @@ public static class FolderDialog {
             IShellItem si;
             if (SHCreateItemFromParsingName(initial, IntPtr.Zero, ref iid, out si) == 0) { dlg.SetFolder(si); }
         }
-        if (dlg.Show(IntPtr.Zero) != 0) { return null; } // 用户取消（或失败）
-        IShellItem item;
-        dlg.GetResult(out item);
-        IntPtr pszName;
-        item.GetDisplayName(0x80058000, out pszName); // SIGDN_FILESYSPATH
-        string path = Marshal.PtrToStringUni(pszName);
-        Marshal.FreeCoTaskMem(pszName);
-        return path;
+        // 用一个屏幕外的置顶隐形窗口当 owner。
+        //
+        // 没有 owner、且调用方是后台进程（核心/插件）时，Windows 的前景锁会让
+        // 对话框直接出现在主窗口后面 —— 用户看到的现象就是"点了选择目录没反应"，
+        // 而这时候 PowerShell 进程其实正卡在等用户选择。带一个 TopMost 的
+        // owner 窗口后，对话框就会浮到最前面。
+        System.Windows.Forms.Form owner = new System.Windows.Forms.Form();
+        owner.TopMost = true;
+        owner.ShowInTaskbar = false;
+        owner.FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+        owner.StartPosition = System.Windows.Forms.FormStartPosition.Manual;
+        owner.Size = new System.Drawing.Size(1, 1);
+        owner.Location = new System.Drawing.Point(-3000, -3000);
+        owner.Show();
+        owner.Activate();
+        try {
+            if (dlg.Show(owner.Handle) != 0) { return null; } // 用户取消（或失败）
+            IShellItem item;
+            dlg.GetResult(out item);
+            IntPtr pszName;
+            item.GetDisplayName(0x80058000, out pszName); // SIGDN_FILESYSPATH
+            string path = Marshal.PtrToStringUni(pszName);
+            Marshal.FreeCoTaskMem(pszName);
+            return path;
+        } finally {
+            owner.Close();
+        }
     }
 }
 `
@@ -95,7 +114,7 @@ func pickFolderScript(title, initial string) string {
 	return fmt.Sprintf(`$src = @'
 %s
 '@
-Add-Type -TypeDefinition $src
+Add-Type -TypeDefinition $src -ReferencedAssemblies System.Windows.Forms, System.Drawing
 $r = [FolderDialog]::Pick('%s', '%s')
 if ($r) { [Console]::Out.Write([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($r))) }
 `, csharpDialogSource, title, initial)

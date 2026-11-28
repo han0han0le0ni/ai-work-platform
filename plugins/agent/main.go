@@ -289,6 +289,11 @@ type runParams struct {
 	MaxSteps    int             `json:"maxSteps,omitempty"`
 	TimeoutMs   int             `json:"timeoutMs,omitempty"`
 	Mode        string          `json:"mode,omitempty"` // "chat" = 不使用工具，纯聊天
+	// ReasoningEffort 是模型的推理强度（low / medium / high；空 = 跟随模型默认）。
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	// Permission 是本次运行的写入权限：workspace / readonly / unrestricted。
+	// 由工具执行器真正拦截，agent 只负责透传。
+	Permission string `json:"permission,omitempty"`
 	// Attachments 是本次对话带上来的附件（文件 / 图片 / 视频）。
 	// agent 不理解内容，只负责把它翻译成模型看得懂的形状。
 	Attachments []Attachment `json:"attachments,omitempty"`
@@ -420,7 +425,7 @@ func (a *Agent) run(args json.RawMessage) (any, error) {
 			ToolCalls: out.ToolCalls,
 		})
 		for _, call := range out.ToolCalls {
-			st, msg := a.execTool(round, call)
+			st, msg := a.execTool(round, call, in.Permission)
 			steps = append(steps, st)
 			messages = append(messages, msg)
 		}
@@ -573,6 +578,9 @@ func (a *Agent) chat(messages []Message, tools []ToolSpec, system string, in run
 	if in.Temperature != nil {
 		params["temperature"] = *in.Temperature
 	}
+	if r := strings.TrimSpace(in.ReasoningEffort); r != "" {
+		params["reasoningEffort"] = r
+	}
 	if n := a.ctx.GetConfigInt("maxTokens", 0); n > 0 {
 		params["maxTokens"] = n
 	}
@@ -589,15 +597,16 @@ func (a *Agent) chat(messages []Message, tools []ToolSpec, system string, in run
 }
 
 // execTool 执行一次工具调用，返回给界面看的 Step 和喂回模型的 tool 消息。
-func (a *Agent) execTool(round int, call ToolCall) (Step, Message) {
+func (a *Agent) execTool(round int, call ToolCall, permission string) (Step, Message) {
 	st := Step{Index: round + 1, Tool: call.Name, Args: call.Args}
 	start := time.Now()
 
 	_ = a.ctx.Emit("chat.tool.before", map[string]any{"tool": call.Name, "args": call.Args})
 
 	raw, err := a.ctx.Invoke(toolService, "execute", map[string]any{
-		"name": call.Name,
-		"args": call.Args,
+		"name":       call.Name,
+		"args":       call.Args,
+		"permission": permission,
 	})
 	st.Ms = time.Since(start).Milliseconds()
 

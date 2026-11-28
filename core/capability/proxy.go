@@ -47,6 +47,8 @@ const (
 	// 它同样比 process:spawn 窄：不执行任何插件指定的命令，只调系统自带的
 	// 选目录对话框，结果是一个路径字符串。
 	PermShellPickFolder = "shell:pickfolder"
+	// PermShellPickFiles 只允许"弹系统文件选择对话框，拿回用户选的文件路径"。
+	PermShellPickFiles = "shell:pickfiles"
 )
 
 // 能力方法与所需权限。这是核心暴露给插件的**能力面**，属于公开契约，只增不减。
@@ -61,6 +63,7 @@ var requirements = map[string]string{
 	"core.process.spawn":   PermProcessSpawn,
 	"core.shell.open":      PermShellOpen,
 	"core.shell.pickfolder": PermShellPickFolder,
+	"core.shell.pickfiles":  PermShellPickFiles,
 }
 
 const (
@@ -193,6 +196,8 @@ func (p *Proxy) Dispatch(pluginID, method string, params json.RawMessage) (any, 
 		return p.shellOpen(pluginID, params)
 	case "core.shell.pickfolder":
 		return p.pickFolder(pluginID, params)
+	case "core.shell.pickfiles":
+		return p.pickFiles(pluginID, params)
 	}
 	return nil, jsonrpc.NewError(jsonrpc.CodeMethodNotFound, "核心不支持方法 %s", method)
 }
@@ -915,6 +920,40 @@ func (p *Proxy) pickFolder(pluginID string, params json.RawMessage) (any, *jsonr
 	}
 	p.audit(pluginID, "core.shell.pickfolder", target)
 	return map[string]any{"path": path, "cancelled": cancelled}, nil
+}
+
+// pickFiles 弹系统文件选择对话框（可多选），拿回用户选中的文件路径
+// （需 shell:pickfiles）。与 pickFolder 一样是阻塞调用。
+func (p *Proxy) pickFiles(pluginID string, params json.RawMessage) (any, *jsonrpc.Error) {
+	var in struct {
+		Initial string `json:"initial,omitempty"`
+		Title   string `json:"title,omitempty"`
+	}
+	if err := unmarshal(params, &in); err != nil {
+		return nil, badParams(err)
+	}
+	if strings.TrimSpace(in.Initial) != "" {
+		abs, rpcErr := p.resolve(in.Initial)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		in.Initial = abs
+	}
+	paths, cancelled, err := pickFiles(in.Title, in.Initial)
+	if err != nil {
+		return nil, failed("弹系统文件选择框失败: %v", err)
+	}
+	if paths == nil {
+		paths = []string{}
+	}
+	target := strings.Join(paths, ", ")
+	if cancelled {
+		target = "（用户取消）"
+	} else if n := len(paths); n > 3 {
+		target = strings.Join(paths[:3], ", ") + fmt.Sprintf(" 等 %d 个文件", n)
+	}
+	p.audit(pluginID, "core.shell.pickfiles", target)
+	return map[string]any{"paths": paths, "cancelled": cancelled}, nil
 }
 
 // openCommand 给出"用默认程序打开这个文件"的命令。

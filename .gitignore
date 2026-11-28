@@ -1,6 +1,7 @@
 # 构建产物与运行时数据：全部集中在 runtime/，源码树里不放任何产物
 /runtime/
 /dist/
+/sdk/rust/target/
 
 # 二进制
 *.exe
